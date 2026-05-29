@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# linc-specific
+output/
+inputs/
+tmp/
+logs/
+.qoder/
+spike/
+.linc/
+design/
+*.yaml
