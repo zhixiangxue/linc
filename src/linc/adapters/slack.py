@@ -78,7 +78,10 @@ class SlackAdapter(Adapter):
 
     async def stop(self) -> None:
         # Best-effort teardown; nothing here should throw out.
-        sm, web = self._sm, self._web
+        # Note: AsyncWebClient has no close() — it manages aiohttp sessions
+        # per-request internally. Only the SocketModeClient owns the long-
+        # lived WebSocket and needs explicit disconnect/close.
+        sm = self._sm
         self._sm = None
         self._web = None
         if sm is not None:
@@ -90,11 +93,6 @@ class SlackAdapter(Adapter):
                 await sm.close()
             except Exception:
                 log.exception("slack adapter: close failed")
-        if web is not None:
-            try:
-                await web.close()
-            except Exception:
-                log.exception("slack adapter: web client close failed")
 
     # ----------------------------------------------------------------- inbound
 
