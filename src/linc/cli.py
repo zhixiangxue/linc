@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import logging
 import os
 import signal
 import stat
@@ -103,6 +104,11 @@ async def _open_store(data_dir: Path) -> SqliteStore:
 
 def _check_yaml_perms(path: Path) -> None:
     """Warn (don't fail) if linc.yaml is world/group readable — it holds creds."""
+    import sys
+
+    if sys.platform == "win32":
+        # Windows doesn't use POSIX permission bits; skip this check.
+        return
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
     except OSError:
@@ -119,6 +125,14 @@ def serve(
     config: Path = typer.Option(DEFAULT_CONFIG, "--config", "-c", help="linc.yaml path"),
 ) -> None:
     """Start the gateway daemon (single-instance per data_dir)."""
+    from rich.logging import RichHandler
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%H:%M:%S]",
+        handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
+    )
     if not config.exists():
         _die(f"config not found: {config}")
     _check_yaml_perms(config)
@@ -135,11 +149,24 @@ def serve(
         def _stop_handler() -> None:
             stop.set()
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+        if sys.platform != "win32":
+            for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _stop_handler)
-            except NotImplementedError:
-                pass  # Windows; Ctrl-C will raise KeyboardInterrupt instead
+
+        # --- Banner (before start, so runtime logs appear below) ---
+        import pyfiglet
+        from rich.console import Console
+
+        console = Console()
+        art = pyfiglet.figlet_format("LINC", font="slant")
+        platforms = ", ".join(sorted(gateway.config.adapters)) or "(none)"
+
+        console.print(f"\n{art}", style="cyan bold", highlight=False)
+        console.print(f"  PID:       {os.getpid()}", highlight=False)
+        console.print(f"  data:      {gateway.config.data_dir.resolve()}", highlight=False)
+        console.print(f"  platforms: [bold green]{platforms}[/bold green]", highlight=False)
+        console.print(f"  poll:      {gateway.config.poll_interval_ms}ms", highlight=False)
+        console.print("\n  Press Ctrl+C to stop.\n", highlight=False)
 
         try:
             await gateway.start()
@@ -148,20 +175,33 @@ def serve(
         except LincError as e:
             _die(str(e))
 
-        typer.echo(f"linc serve: started (pid={os.getpid()}); Ctrl-C to stop")
         try:
-            stop_task = asyncio.create_task(stop.wait())
-            fwd_task = asyncio.create_task(gateway.run_forever())
-            done, pending = await asyncio.wait(
-                {stop_task, fwd_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for t in pending:
-                t.cancel()
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
+            if sys.platform == "win32":
+                # Windows: asyncio signal handlers not supported; poll stop event
+                fwd_task = asyncio.create_task(gateway.run_forever())
+                while not stop.is_set() and not fwd_task.done():
+                    await asyncio.sleep(0.3)
+                if not fwd_task.done():
+                    fwd_task.cancel()
+                    try:
+                        await fwd_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            else:
+                stop_task = asyncio.create_task(stop.wait())
+                fwd_task = asyncio.create_task(gateway.run_forever())
+                done, pending = await asyncio.wait(
+                    {stop_task, fwd_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        except KeyboardInterrupt:
+            pass
         finally:
             await gateway.stop()
             typer.echo("linc serve: stopped")
@@ -321,7 +361,7 @@ def status(
         return
 
     # Try to grab the lock non-blocking. If it fails, someone holds it.
-    import fcntl
+    from .core.locks import _platform_lock, _platform_unlock
 
     try:
         fd = os.open(pid_path, os.O_RDWR)
@@ -330,7 +370,7 @@ def status(
         return
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _platform_lock(fd)
         except BlockingIOError:
             pid_text = ""
             try:
@@ -341,7 +381,7 @@ def status(
             return
         # We got the lock — nobody else holds it.
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _platform_unlock(fd)
         except OSError:
             pass
         typer.echo("gateway:  not running (linc.pid stale)")

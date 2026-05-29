@@ -1,26 +1,62 @@
-"""Single-instance flock utilities (POSIX: Linux/macOS).
+"""Single-instance lock utilities (cross-platform: Linux/macOS/Windows).
 
 Two locks live under data_dir:
   - linc.pid    : held by `linc serve` for as long as the daemon (LincGateway) runs.
   - agent.lock  : held by the agent process inside `async with Linc(...)`.
 
-Both use fcntl.flock(LOCK_EX | LOCK_NB). Acquisition is non-blocking; if another
-process holds the lock we raise AlreadyRunning immediately rather than queueing.
-
-Windows is intentionally not supported in v0.1 (see PRD §18, item 5).
+On POSIX systems we use fcntl.flock(LOCK_EX | LOCK_NB).
+On Windows we use msvcrt.locking(LK_NBLCK).
+Acquisition is non-blocking; if another process holds the lock we raise
+AlreadyRunning immediately rather than queueing.
 """
 
 from __future__ import annotations
 
-import fcntl
 import os
+import sys
 from pathlib import Path
 
 from .errors import AlreadyRunning
 
+# --- Platform-specific lock/unlock primitives ---
+
+if sys.platform == "win32":
+    import msvcrt
+
+    _LOCK_LEN = 1  # lock the first byte
+
+    def _platform_lock(fd: int) -> None:
+        """Non-blocking exclusive lock (Windows)."""
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, _LOCK_LEN)
+        except (OSError, IOError) as e:
+            raise BlockingIOError(str(e)) from e
+
+    def _platform_unlock(fd: int) -> None:
+        """Unlock (Windows). Seek to 0 first since msvcrt locks by position."""
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, _LOCK_LEN)
+        except OSError:
+            pass
+
+else:
+    import fcntl
+
+    def _platform_lock(fd: int) -> None:
+        """Non-blocking exclusive lock (POSIX)."""
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _platform_unlock(fd: int) -> None:
+        """Unlock (POSIX)."""
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+# --- Public API ---
+
 
 def _acquire(lock_path: Path, label: str) -> int:
-    """Acquire an exclusive non-blocking flock on `lock_path`.
+    """Acquire an exclusive non-blocking lock on `lock_path`.
 
     Returns the open file descriptor on success. The fd MUST be retained by the
     caller until release(); closing the fd implicitly releases the lock, so we
@@ -29,7 +65,7 @@ def _acquire(lock_path: Path, label: str) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _platform_lock(fd)
     except BlockingIOError as e:
         os.close(fd)
         raise AlreadyRunning(
@@ -47,9 +83,9 @@ def _acquire(lock_path: Path, label: str) -> int:
 
 
 def release(fd: int) -> None:
-    """Release the flock and close the descriptor. Idempotent-safe at shutdown."""
+    """Release the lock and close the descriptor. Idempotent-safe at shutdown."""
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        _platform_unlock(fd)
     finally:
         try:
             os.close(fd)

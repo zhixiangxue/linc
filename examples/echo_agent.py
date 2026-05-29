@@ -32,7 +32,7 @@ async def main() -> None:
         while True:
             unread = await slack.read_unread()
             for m in unread:
-                reply = f"echo: {m.content.text or ''}"
+                reply = f"{m.content.text or ''}"
                 log.info("[%s] %s -> %s", m.conv_id, m.content.text, reply)
                 await slack.send(reply, conv_id=m.conv_id)
             await asyncio.sleep(1.0)

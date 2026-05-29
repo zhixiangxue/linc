@@ -16,6 +16,7 @@ override `on_event` if they need custom inbound bookkeeping.
 from __future__ import annotations
 
 import abc
+import logging
 from typing import Any, ClassVar, NamedTuple
 
 from pydantic import BaseModel
@@ -23,6 +24,8 @@ from pydantic import BaseModel
 from .models import Content, Sender
 from .hub import Hub
 from .store import SqliteStore
+
+log = logging.getLogger(__name__)
 
 
 class ParsedInbound(NamedTuple):
@@ -99,7 +102,7 @@ class Adapter(abc.ABC):
         parsed = self.parse_inbound(raw)
         if parsed is None:
             return None
-        return await self.store.insert_inbound(
+        row_id = await self.store.insert_inbound(
             platform=self.name,
             conv_id=parsed.conv_id,
             msg_id=parsed.msg_id,
@@ -108,3 +111,10 @@ class Adapter(abc.ABC):
             content=parsed.content,
             raw=raw,
         )
+        if row_id is not None:
+            text_preview = (parsed.content.text or "")[:80]
+            log.info(
+                "\u2b07 [%s] %s | %s: %s",
+                self.name, parsed.conv_id, parsed.sender.name or parsed.sender.id, text_preview,
+            )
+        return row_id

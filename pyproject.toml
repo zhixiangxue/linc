@@ -13,6 +13,8 @@ dependencies = [
     "httpx>=0.27",
     "structlog>=24.1",
     "typer>=0.12",
+    "pyfiglet>=1.0",
+    "rich>=13.0",
     # Slack: official SDK; AsyncWebClient + SocketModeClient (aiohttp-based) are bundled.
     "slack-sdk>=3.27",
     "aiohttp>=3.9",
@@ -40,6 +42,9 @@ packages = ["src/linc"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.uv]
+index-url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

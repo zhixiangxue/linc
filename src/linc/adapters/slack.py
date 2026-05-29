@@ -15,9 +15,8 @@ etc. We filter all of those in ``parse_inbound`` (return ``None``) so the
 default ``on_event`` simply drops them. Without this filter the bot will
 echo its own replies into an infinite loop.
 
-Sender resolution: ``users.info`` is an async REST call and ``parse_inbound``
-is sync, so v0.1 stores ``sender.name = user_id`` as-is. v0.2 can add a small
-LRU cache + async resolution by overriding ``on_event``.
+Sender resolution: ``on_event`` resolves user IDs to display names via
+``users.info`` with an in-memory cache (one API call per unique user).
 """
 
 from __future__ import annotations
@@ -59,6 +58,7 @@ class SlackAdapter(Adapter):
         # opens any sockets (important for tests).
         self._web: Any = None
         self._sm: Any = None
+        self._user_cache: dict[str, str] = {}  # user_id -> display_name
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -95,6 +95,58 @@ class SlackAdapter(Adapter):
                 log.exception("slack adapter: close failed")
 
     # ----------------------------------------------------------------- inbound
+
+    async def _resolve_user_name(self, user_id: str) -> str:
+        """Resolve a Slack user ID to display name, with in-memory cache."""
+        if user_id in self._user_cache:
+            return self._user_cache[user_id]
+        if self._web is None:
+            return user_id
+        try:
+            resp = await self._web.users_info(user=user_id)
+            data = getattr(resp, "data", resp) or {}
+            user_obj = data.get("user", {})
+            profile = user_obj.get("profile", {})
+            name = (
+                profile.get("display_name_normalized")
+                or profile.get("display_name")
+                or profile.get("real_name_normalized")
+                or user_obj.get("real_name")
+                or profile.get("real_name")
+                or user_id
+            )
+            log.debug("slack user resolve: %s -> %s (profile=%r)", user_id, name, profile)
+            self._user_cache[user_id] = name
+            return name
+        except Exception as e:
+            log.warning("slack adapter: users.info failed for %s: %s", user_id, e)
+            self._user_cache[user_id] = user_id
+            return user_id
+
+    async def on_event(self, raw: dict[str, Any]) -> int | None:
+        """Override to resolve user display name before persisting."""
+        parsed = self.parse_inbound(raw)
+        if parsed is None:
+            return None
+        # Resolve real display name asynchronously
+        display_name = await self._resolve_user_name(parsed.sender.id)
+        sender = Sender(id=parsed.sender.id, name=display_name)
+        row_id = await self.store.insert_inbound(
+            platform=self.name,
+            conv_id=parsed.conv_id,
+            msg_id=parsed.msg_id,
+            ts=parsed.ts,
+            sender=sender,
+            content=parsed.content,
+            raw=raw,
+        )
+        if row_id is not None:
+            text_preview = (parsed.content.text or "")[:80]
+            log.info(
+                "\u2b07 [%s] %s | %s (%s): %s",
+                self.name, parsed.conv_id, display_name, parsed.sender.id, text_preview,
+            )
+        return row_id
 
     async def _listener(self, client: Any, req: Any) -> None:
         """Single Socket Mode dispatch entry point.
@@ -147,7 +199,7 @@ class SlackAdapter(Adapter):
         except (TypeError, ValueError):
             return None
 
-        # ``users.info`` is async; v0.1 stores the user id as the display name.
+        # Sender uses user_id as placeholder; on_event resolves the real name.
         sender = Sender(id=str(user), name=str(user))
         content = Content(text=str(text))
         return ParsedInbound(

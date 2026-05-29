@@ -218,6 +218,10 @@ class LincGateway:
                 try:
                     plat_msg_id, plat_raw = await adapter.send(msg.conv_id, msg.content)
                     await self.store.mark_sent(msg.id, plat_msg_id, plat_raw)
+                    text_preview = (msg.content.text or "")[:80]
+                    log.info(
+                        "\u2b06 [%s] %s | %s", platform, msg.conv_id, text_preview,
+                    )
                 except SendError as e:
                     log.warning("send failed (%s id=%d): %s", platform, msg.id, e)
                     await self.store.mark_failed(msg.id, f"{type(e).__name__}: {e}")
