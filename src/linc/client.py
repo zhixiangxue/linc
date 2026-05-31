@@ -3,7 +3,7 @@
 Typical usage in an agent script (NOT inside the gateway process)::
 
     async with Linc(".linc") as linc:
-        slack = linc.slack()
+        slack = linc.get("slack")
         unread = await slack.read_unread()
         for m in unread:
             await slack.send(conv_id=m.conv_id, content=f"echo: {m.content.text}")
@@ -12,9 +12,9 @@ Design notes:
 - ``Linc.__aenter__`` acquires ``agent.lock`` flock so at most one agent process
   talks to a given data_dir at a time. The gateway holds its own ``linc.pid``
   lock; the two are independent — gateway and agent can (and must) coexist.
-- ``linc.<platform>()`` is resolved via ``__getattr__`` and validated against the
-  adapter registry. Typos like ``linc.wxchat()`` fail fast with ``AttributeError``
-  instead of silently no-op'ing.
+- ``linc.get(platform)`` is the preferred explicit way to obtain a platform
+  client. ``linc.<platform>()`` remains as a compatibility alias and is resolved
+  via ``__getattr__`` with adapter registry validation.
 - The client does NOT instantiate adapters and does NOT need ``linc.yaml``. It
   only needs read/write access to the SQLite file at ``<data_dir>/linc.db``.
 - All write operations go through the SAME ``SqliteStore`` API used by the
@@ -85,8 +85,23 @@ class Linc:
 
     # ------------------------------------------------------------------ platform factory
 
+    def get(self, platform: str, conv_id: str | None = None) -> "Client":
+        """Return a platform client by name.
+
+        This is the preferred explicit API for multi-platform agents. The
+        dynamic ``linc.slack()``/``linc.feishu()`` factories remain available as
+        compatibility aliases, but new code should prefer ``linc.get(name)``.
+        """
+        if not is_supported(platform):
+            raise ValueError(
+                f"unknown IM platform {platform!r}; "
+                f"registered platforms are {sorted(supported())}. "
+                f"Did you forget to import the adapter, or mistype the name?"
+            )
+        return Client(name=platform, store=self.store, conv_id=conv_id)
+
     def __getattr__(self, name: str) -> Callable[..., "Client"]:
-        """``linc.slack`` / ``linc.telegram`` ... -> factory callable.
+        """Compatibility alias: ``linc.slack()`` / ``linc.feishu()`` ...
 
         Raises ``AttributeError`` for any name not in the adapter registry, so
         typos surface at ``linc.wxchat()`` instead of being silently swallowed.
@@ -103,7 +118,7 @@ class Linc:
             )
 
         def factory(conv_id: str | None = None) -> "Client":
-            return Client(name=name, store=self.store, conv_id=conv_id)
+            return self.get(name, conv_id=conv_id)
 
         return factory
 

@@ -17,7 +17,6 @@ import asyncio
 import json as _json
 import logging
 import os
-import signal
 import stat
 import sys
 from datetime import datetime, timezone
@@ -133,6 +132,7 @@ def serve(
         datefmt="[%H:%M:%S]",
         handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
     )
+    logging.getLogger("aiorun").setLevel(logging.WARNING)
     if not config.exists():
         _die(f"config not found: {config}")
     _check_yaml_perms(config)
@@ -142,17 +142,17 @@ def serve(
     except LincError as e:
         _die(str(e))
 
+    shutdown_started = False
+
+    async def _shutdown(_loop: asyncio.AbstractEventLoop | None = None) -> None:
+        nonlocal shutdown_started
+        if shutdown_started:
+            return
+        shutdown_started = True
+        await gateway.stop()
+        typer.echo("linc serve: stopped")
+
     async def _run() -> None:
-        loop = asyncio.get_running_loop()
-        stop = asyncio.Event()
-
-        def _stop_handler() -> None:
-            stop.set()
-
-        if sys.platform != "win32":
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, _stop_handler)
-
         # --- Banner (before start, so runtime logs appear below) ---
         import pyfiglet
         from rich.console import Console
@@ -170,46 +170,22 @@ def serve(
 
         try:
             await gateway.start()
+            await gateway.run_forever()
         except AlreadyRunning as e:
             _die(str(e))
         except LincError as e:
             _die(str(e))
-
-        try:
-            if sys.platform == "win32":
-                # Windows: asyncio signal handlers not supported; poll stop event
-                fwd_task = asyncio.create_task(gateway.run_forever())
-                while not stop.is_set() and not fwd_task.done():
-                    await asyncio.sleep(0.3)
-                if not fwd_task.done():
-                    fwd_task.cancel()
-                    try:
-                        await fwd_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-            else:
-                stop_task = asyncio.create_task(stop.wait())
-                fwd_task = asyncio.create_task(gateway.run_forever())
-                done, pending = await asyncio.wait(
-                    {stop_task, fwd_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for t in pending:
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
-        except KeyboardInterrupt:
-            pass
         finally:
-            await gateway.stop()
-            typer.echo("linc serve: stopped")
+            await _shutdown()
 
-    try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        pass
+    import aiorun
+
+    aiorun.run(
+        _run(),
+        shutdown_callback=_shutdown,
+        stop_on_unhandled_errors=True,
+        timeout_task_shutdown=1,
+    )
 
 
 # ============================================================================
@@ -274,11 +250,11 @@ def send(
     async def _run() -> None:
         try:
             async with Linc(data_dir) as linc:
-                client = getattr(linc, platform)()
+                client = linc.get(platform)
                 row_id = await client.send(text, conv_id=conv_id)
         except AlreadyRunning as e:
             _die(str(e))
-        except AttributeError as e:
+        except ValueError as e:
             _die(str(e))
         typer.echo(f"queued outbound id={row_id} platform={platform} conv={conv_id}")
 

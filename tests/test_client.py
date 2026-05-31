@@ -101,12 +101,26 @@ async def test_dunder_attributes_not_intercepted(tmp_path: Path):
 
 async def test_registered_platform_returns_handle(tmp_path: Path, fake_registered):
     async with Linc(tmp_path) as linc:
-        fake = linc.fake()
+        fake = linc.get("fake")
         assert fake.name == "fake"
         # Bind conv at factory time.
-        chat = linc.fake(conv_id="C42")
+        chat = linc.get("fake", conv_id="C42")
         assert chat.name == "fake"
         assert chat._conv_id == "C42"
+
+
+async def test_dynamic_platform_factory_remains_compat_alias(tmp_path: Path, fake_registered):
+    async with Linc(tmp_path) as linc:
+        fake = linc.fake()
+        assert fake.name == "fake"
+        chat = linc.fake(conv_id="C42")
+        assert chat._conv_id == "C42"
+
+
+async def test_get_unknown_platform_raises_value_error(tmp_path: Path, fake_registered):
+    async with Linc(tmp_path) as linc:
+        with pytest.raises(ValueError, match="unknown IM platform"):
+            linc.get("wxchat")
 
 
 # ------------------------------------------------------------------ send
@@ -114,7 +128,7 @@ async def test_registered_platform_returns_handle(tmp_path: Path, fake_registere
 
 async def test_send_string_enqueues_pending_outbound(tmp_path: Path, fake_registered):
     async with Linc(tmp_path) as linc:
-        row_id = await linc.fake().send("hello world", conv_id="C1")
+        row_id = await linc.get("fake").send("hello world", conv_id="C1")
         assert row_id > 0
         rows = await linc.store.list_pending("fake")
         assert len(rows) == 1
@@ -129,7 +143,7 @@ async def test_send_content_with_attachments(tmp_path: Path, fake_registered):
         attachments=[Attachment(kind="image", url="https://x/y.png")],
     )
     async with Linc(tmp_path) as linc:
-        await linc.fake().send(payload, conv_id="C1")
+        await linc.get("fake").send(payload, conv_id="C1")
         rows = await linc.store.list_pending("fake")
         assert len(rows) == 1
         assert rows[0].content.text == "see image"
@@ -139,7 +153,7 @@ async def test_send_content_with_attachments(tmp_path: Path, fake_registered):
 
 async def test_send_uses_bound_conv_id(tmp_path: Path, fake_registered):
     async with Linc(tmp_path) as linc:
-        chat = linc.fake(conv_id="C-bound")
+        chat = linc.get("fake", conv_id="C-bound")
         await chat.send("hi")
         rows = await linc.store.list_pending("fake")
         assert rows[0].conv_id == "C-bound"
@@ -147,7 +161,7 @@ async def test_send_uses_bound_conv_id(tmp_path: Path, fake_registered):
 
 async def test_send_method_arg_overrides_bound_conv_id(tmp_path: Path, fake_registered):
     async with Linc(tmp_path) as linc:
-        chat = linc.fake(conv_id="C-bound")
+        chat = linc.get("fake", conv_id="C-bound")
         await chat.send("hi", conv_id="C-override")
         rows = await linc.store.list_pending("fake")
         assert rows[0].conv_id == "C-override"
@@ -156,12 +170,12 @@ async def test_send_method_arg_overrides_bound_conv_id(tmp_path: Path, fake_regi
 async def test_send_without_conv_id_raises(tmp_path: Path, fake_registered):
     async with Linc(tmp_path) as linc:
         with pytest.raises(ValueError, match="conv_id"):
-            await linc.fake().send("hi")
+            await linc.get("fake").send("hi")
 
 
 async def test_conv_chain_returns_new_handle(tmp_path: Path, fake_registered):
     async with Linc(tmp_path) as linc:
-        base = linc.fake()
+        base = linc.get("fake")
         chat = base.conv("C-chain")
         assert base._conv_id is None
         assert chat._conv_id == "C-chain"

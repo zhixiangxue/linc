@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from .adapters import get as get_adapter_cls
@@ -40,6 +41,7 @@ from .core.locks import acquire_gateway_lock, release
 from .core.store import SqliteStore
 
 log = logging.getLogger(__name__)
+ADAPTER_STOP_TIMEOUT = 5.0
 
 
 class LincGateway:
@@ -65,6 +67,13 @@ class LincGateway:
         """
         data_dir = self.config.data_dir.expanduser()
         data_dir.mkdir(parents=True, exist_ok=True)
+        adapter_names = list(self.config.adapters)
+        log.info(
+            "🚀 linc-gateway starting: data_dir=%s adapters=%s pid=%d",
+            data_dir,
+            adapter_names,
+            os.getpid(),
+        )
 
         # 1. flock so only one gateway per data_dir
         self._lock_fd = acquire_gateway_lock(data_dir)
@@ -91,7 +100,7 @@ class LincGateway:
             self._dispatch_loop(), name="linc-dispatcher"
         )
         log.info(
-            "linc-gateway started: data_dir=%s adapters=%s pid=%d",
+            "🎉 linc-gateway ready: data_dir=%s adapters=%s pid=%d",
             data_dir, sorted(self.adapters), os.getpid(),
         )
 
@@ -111,7 +120,13 @@ class LincGateway:
         # Stop adapters in reverse start order. Best-effort.
         for name, adapter in reversed(list(self.adapters.items())):
             try:
-                await adapter.stop()
+                await asyncio.wait_for(adapter.stop(), timeout=ADAPTER_STOP_TIMEOUT)
+            except TimeoutError:
+                log.warning(
+                    "adapter %s stop() timed out after %.1fs; continuing shutdown",
+                    name,
+                    ADAPTER_STOP_TIMEOUT,
+                )
             except Exception:
                 log.exception("adapter %s stop() failed", name)
         self.adapters.clear()
@@ -143,15 +158,25 @@ class LincGateway:
     async def _build_adapters(self) -> None:
         """Instantiate adapters listed in linc.yaml. Validate each's config."""
         assert self.store is not None and self.hub is not None
-        for platform, raw in self.config.adapters.items():
+        total = len(self.config.adapters)
+        if total == 0:
+            log.warning("⚠️ no adapters configured; gateway will only run the outbox dispatcher")
+            return
+
+        log.info("🧩 starting %d adapter(s): %s", total, list(self.config.adapters))
+        for index, (platform, raw) in enumerate(self.config.adapters.items(), start=1):
+            started_at = time.perf_counter()
+            log.info("🔌 [%d/%d] starting adapter: %s", index, total, platform)
             try:
                 adapter_cls = get_adapter_cls(platform)
             except Exception as e:
+                log.error("❌ [%d/%d] adapter %s not found: %s", index, total, platform, e)
                 raise ConfigError(
                     f"linc.yaml: adapters.{platform!r} -> {e}"
                 ) from e
             cfg_cls = getattr(adapter_cls, "Config", None)
             if cfg_cls is None:
+                log.error("❌ [%d/%d] adapter %s has no Config class", index, total, platform)
                 raise ConfigError(
                     f"adapter {platform!r} ({adapter_cls.__qualname__}) "
                     f"is missing a Config class attribute"
@@ -159,6 +184,7 @@ class LincGateway:
             try:
                 cfg = cfg_cls.model_validate(raw or {})
             except Exception as e:
+                log.error("❌ [%d/%d] adapter %s config invalid: %s", index, total, platform, e)
                 raise ConfigError(
                     f"linc.yaml: adapters.{platform}: {e}"
                 ) from e
@@ -166,6 +192,14 @@ class LincGateway:
             try:
                 await adapter.start()
             except Exception:
+                elapsed = time.perf_counter() - started_at
+                log.exception(
+                    "❌ [%d/%d] adapter %s failed after %.2fs",
+                    index,
+                    total,
+                    platform,
+                    elapsed,
+                )
                 # Roll back any adapters already started in this loop.
                 for n, a in reversed(list(self.adapters.items())):
                     try:
@@ -175,6 +209,8 @@ class LincGateway:
                 self.adapters.clear()
                 raise
             self.adapters[platform] = adapter
+            elapsed = time.perf_counter() - started_at
+            log.info("✅ [%d/%d] adapter %s started in %.2fs", index, total, platform, elapsed)
 
     async def _teardown_partial(self) -> None:
         """Best-effort teardown when start() fails partway through."""

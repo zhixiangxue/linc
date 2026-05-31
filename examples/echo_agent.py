@@ -1,6 +1,7 @@
-"""Example: an echo agent.
+"""Example: a cross-platform echo agent.
 
-Reads unread Slack messages and replies "echo: <text>" to each. Run alongside
+Reads unread messages from every enabled LINC platform and replies the same text
+back to the platform/conversation where each message arrived. Run alongside
 ``linc serve`` (in a separate terminal) — the two processes coordinate via
 ``.linc/linc.pid`` (gateway) and ``.linc/agent.lock`` (this script).
 
@@ -27,14 +28,15 @@ log = logging.getLogger("echo_agent")
 
 async def main() -> None:
     async with Linc(".linc") as linc:
-        slack = linc.slack()
-        log.info("echo agent started; waiting for unread messages...")
+        log.info("cross-platform echo agent started; waiting for unread messages...")
         while True:
-            unread = await slack.read_unread()
+            unread = await linc.read_unread_all()
             for m in unread:
                 reply = f"{m.content.text or ''}"
-                log.info("[%s] %s -> %s", m.conv_id, m.content.text, reply)
-                await slack.send(reply, conv_id=m.conv_id)
+                client = linc.get(m.platform)
+                sender = m.sender.name or m.sender.id
+                log.info("[%s/%s] %s (%s) -> %s", m.platform, m.conv_id, sender, m.sender.id, reply)
+                await client.send(reply, conv_id=m.conv_id)
             await asyncio.sleep(1.0)
 
 

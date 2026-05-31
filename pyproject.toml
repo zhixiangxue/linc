@@ -15,9 +15,18 @@ dependencies = [
     "typer>=0.12",
     "pyfiglet>=1.0",
     "rich>=13.0",
+    "aiorun>=2024.8.1",
+    # LLM agent example: Chak provides a unified Conversation API for DeepSeek and others.
+    "chakpy>=0.3.7",
     # Slack: official SDK; AsyncWebClient + SocketModeClient (aiohttp-based) are bundled.
     "slack-sdk>=3.27",
     "aiohttp>=3.9",
+    # Feishu (Lark): official SDK — WebSocket events + REST API.
+    "lark-oapi>=1.4.0",
+    # DingTalk: official Stream SDK — WebSocket connection + ChatbotHandler.
+    "dingtalk-stream>=0.24",
+    # WeCom AI Bot: official SDK — WebSocket long connection mode.
+    "wecom-aibot-python-sdk>=1.0",
 ]
 
 [project.optional-dependencies]

@@ -83,12 +83,24 @@ def is_supported(name: str) -> bool:
     return name in _REGISTRY
 
 
-# Eager-load built-in adapters here once they exist. v0.1: Slack only.
-# The import is wrapped so that test-time partial installs (e.g. running
-# core unit tests without slack-sdk) do not break.
+# Eager-load built-in adapters. Each import is wrapped so that partial
+# installs (e.g. running core unit tests without a particular SDK) do not
+# break the registry for other adapters.
 def _load_builtins() -> None:
     try:
-        from . import slack  # noqa: F401  -- module registers SlackAdapter on import
+        from . import slack  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        from . import feishu  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        from . import dingtalk  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        from . import wecom  # noqa: F401
     except ImportError:
         pass
 
