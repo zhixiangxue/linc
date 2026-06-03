@@ -356,8 +356,8 @@ wheels = [
 
 [[package]]
 name = "chakpy"
-version = "0.3.7"
-source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+version = "0.4.0"
+source = { editable = "/Users/zhixiang.xue/zeitro/chak-ai" }
 dependencies = [
     { name = "anthropic" },
     { name = "boto3" },
@@ -370,10 +370,67 @@ dependencies = [
     { name = "tenacity" },
     { name = "tiktoken" },
 ]
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/71/f5/2af0658800becddee87282181026866bb06da452404e7294e744dad1c6f3/chakpy-0.3.7.tar.gz", hash = "sha256:d0ef13a68fa236697484578cd396ffc98ff8d097cbb9bb03e3c1b437bc23b496" }
-wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/7a/5b/6a988d98cde2f2a69ba64c05ac3700a81aa465b5d2d82060e322dd102e7d/chakpy-0.3.7-py3-none-any.whl", hash = "sha256:020a60eba0202506cae64c68d97ed3a14daf6880323fd31f811bca9c93524dbb" },
+
+[package.metadata]
+requires-dist = [
+    { name = "aiofiles", marker = "extra == 'all'", specifier = ">=23.0.0" },
+    { name = "aiofiles", marker = "extra == 'documents'", specifier = ">=23.0.0" },
+    { name = "aiohttp", marker = "extra == 'all'", specifier = ">=3.9.0" },
+    { name = "aiohttp", marker = "extra == 'documents'", specifier = ">=3.9.0" },
+    { name = "anthropic", specifier = ">=0.40.0" },
+    { name = "beautifulsoup4", marker = "extra == 'all'", specifier = ">=4.12.0" },
+    { name = "beautifulsoup4", marker = "extra == 'tools'", specifier = ">=4.12.0" },
+    { name = "beautifulsoup4", marker = "extra == 'web'", specifier = ">=4.12.0" },
+    { name = "boto3", specifier = ">=1.26.0" },
+    { name = "dashscope", specifier = ">=1.20.0" },
+    { name = "ddgs", marker = "extra == 'all'", specifier = ">=0.1.0" },
+    { name = "ddgs", marker = "extra == 'tools'", specifier = ">=0.1.0" },
+    { name = "ddgs", marker = "extra == 'web'", specifier = ">=0.1.0" },
+    { name = "docstring-parser", specifier = ">=0.15" },
+    { name = "e2b", marker = "extra == 'all'", specifier = ">=2.0.0" },
+    { name = "e2b", marker = "extra == 'tools'", specifier = ">=2.0.0" },
+    { name = "fastapi", marker = "extra == 'all'", specifier = ">=0.104.0" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.104.0" },
+    { name = "firecrawl-py", marker = "extra == 'all'", specifier = ">=1.0.0" },
+    { name = "firecrawl-py", marker = "extra == 'tools'", specifier = ">=1.0.0" },
+    { name = "firecrawl-py", marker = "extra == 'web'", specifier = ">=1.0.0" },
+    { name = "httpx", specifier = ">=0.24.0" },
+    { name = "loguru", specifier = ">=0.7.0" },
+    { name = "markdown", marker = "extra == 'all'", specifier = ">=3.4.0" },
+    { name = "markdown", marker = "extra == 'tools'", specifier = ">=3.4.0" },
+    { name = "openai", specifier = ">=1.0.0" },
+    { name = "openpyxl", marker = "extra == 'all'", specifier = ">=3.1.0" },
+    { name = "openpyxl", marker = "extra == 'documents'", specifier = ">=3.1.0" },
+    { name = "openpyxl", marker = "extra == 'tools'", specifier = ">=3.1.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "pymupdf", marker = "extra == 'all'", specifier = ">=1.23.0" },
+    { name = "pymupdf", marker = "extra == 'documents'", specifier = ">=1.23.0" },
+    { name = "pymupdf-layout", marker = "extra == 'all'", specifier = ">=1.27.0" },
+    { name = "pymupdf-layout", marker = "extra == 'tools'", specifier = ">=1.27.0" },
+    { name = "pymupdf4llm", marker = "extra == 'all'", specifier = ">=0.0.17" },
+    { name = "pymupdf4llm", marker = "extra == 'tools'", specifier = ">=0.0.17" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.23.0" },
+    { name = "python-docx", marker = "extra == 'all'", specifier = ">=1.0.0" },
+    { name = "python-docx", marker = "extra == 'documents'", specifier = ">=1.0.0" },
+    { name = "pyyaml", marker = "extra == 'all'", specifier = ">=6.0" },
+    { name = "pyyaml", marker = "extra == 'server'", specifier = ">=6.0" },
+    { name = "readability-lxml", marker = "extra == 'all'", specifier = ">=0.8.1" },
+    { name = "readability-lxml", marker = "extra == 'tools'", specifier = ">=0.8.1" },
+    { name = "readability-lxml", marker = "extra == 'web'", specifier = ">=0.8.1" },
+    { name = "requests", marker = "extra == 'all'", specifier = ">=2.31.0" },
+    { name = "requests", marker = "extra == 'documents'", specifier = ">=2.31.0" },
+    { name = "tavily-python", marker = "extra == 'all'", specifier = ">=0.3.0" },
+    { name = "tavily-python", marker = "extra == 'tools'", specifier = ">=0.3.0" },
+    { name = "tavily-python", marker = "extra == 'web'", specifier = ">=0.3.0" },
+    { name = "tenacity", specifier = ">=9.0.0" },
+    { name = "tiktoken", specifier = ">=0.5.0" },
+    { name = "uvicorn", marker = "extra == 'all'", specifier = ">=0.24.0" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.24.0" },
+    { name = "websockets", marker = "extra == 'all'", specifier = ">=12.0" },
+    { name = "websockets", marker = "extra == 'server'", specifier = ">=12.0" },
 ]
+provides-extras = ["server", "documents", "web", "tools", "test", "all"]
 
 [[package]]
 name = "charset-normalizer"
@@ -943,6 +1000,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rich" },
     { name = "slack-sdk" },
+    { name = "slackify-markdown" },
     { name = "structlog" },
     { name = "typer" },
     { name = "wecom-aibot-python-sdk" },
@@ -962,7 +1020,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "aiorun", specifier = ">=2024.8.1" },
     { name = "aiosqlite", specifier = ">=0.20.0" },
-    { name = "chakpy", specifier = ">=0.3.7" },
+    { name = "chakpy", editable = "/Users/zhixiang.xue/zeitro/chak-ai" },
     { name = "dingtalk-stream", specifier = ">=0.24" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "lark-oapi", specifier = ">=1.4.0" },
@@ -977,6 +1035,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "slack-sdk", specifier = ">=3.27" },
+    { name = "slackify-markdown", specifier = ">=0.2" },
     { name = "structlog", specifier = ">=24.1" },
     { name = "typer", specifier = ">=0.12" },
     { name = "wecom-aibot-python-sdk", specifier = ">=1.0" },
@@ -1874,6 +1933,18 @@ source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/0e/00/16258bfa547559b2c936b50c882b4f0a36ebf6b69639eb763d8fa5e8d6cb/slack_sdk-3.42.0.tar.gz", hash = "sha256:873db9e1f632ac650ffdbf9d8ba825f3e9e7e576a1e4f9604ccb2a15b3727e3d" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/ce/ef/8a1556bd4843443993fc116783790a7cc553601a37f7d965ec26eef95e76/slack_sdk-3.42.0-py2.py3-none-any.whl", hash = "sha256:eb39aff97e476e10cc5a8ac29bd2e79a9959e880d9fe0c03b4e8f05b2ac996ff" },
+]
+
+[[package]]
+name = "slackify-markdown"
+version = "0.2.4"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "markdown-it-py" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/8d/07/e6f7fe419b21e7bc198f62c9074f7d5ab398b67dc455ccb3190dc31f91f7/slackify_markdown-0.2.4.tar.gz", hash = "sha256:90b57c0a4ef81306c2208573ab4d3afc945797eed0dd04c4876b4a0ca7222619" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/b9/36/b4f9788907b95b5f217fa9602c94f97ceb2af902aaa2396f37ee7b1c74a0/slackify_markdown-0.2.4-py3-none-any.whl", hash = "sha256:5dd7539facafb6c0add7d895bf3501ba25cd7539ee8e06fc0a3adfef237d647c" },
 ]
 
 [[package]]

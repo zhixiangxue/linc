@@ -22,6 +22,7 @@ Sender resolution: ``on_event`` resolves user IDs to display names via
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -32,6 +33,84 @@ from ..core.models import Content, Sender
 from . import register
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Markdown → Slack mrkdwn conversion
+# ---------------------------------------------------------------------------
+
+# Patterns that need special handling beyond what slackify_markdown provides.
+_TABLE_RE = re.compile(r"(?m)^\|.*\|$(?:\n\|[\s:|-]*\|$)(?:\n\|.*\|$)*")
+_CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_RE = re.compile(r"`[^`]+`")
+_LEFTOVER_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_LEFTOVER_HEADER_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+_LATEX_BLOCK_RE = re.compile(r"\\\[[\s\S]*?\\\]")
+_LATEX_INLINE_RE = re.compile(r"\\\([\s\S]*?\\\)")
+
+
+def _table_to_text(match: re.Match) -> str:
+    """Convert a Markdown table into Slack-friendly bullet-style text."""
+    lines = [ln.strip() for ln in match.group(0).strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return match.group(0)
+    headers = [h.strip() for h in lines[0].strip("|").split("|")]
+    start = 2 if re.fullmatch(r"[|\s:\-]+", lines[1]) else 1
+    rows = []
+    for line in lines[start:]:
+        cells = (line.strip("|").split("|") + [""] * len(headers))[:len(headers)]
+        parts = [f"*{headers[i].strip()}*: {cells[i].strip()}" for i in range(len(headers)) if cells[i].strip()]
+        if parts:
+            rows.append(" · ".join(parts))
+    return "\n".join(rows)
+
+
+def _to_slack_mrkdwn(text: str) -> str:
+    """Convert LLM-flavored Markdown to Slack mrkdwn format."""
+    if not text:
+        return ""
+
+    # Strip LaTeX math — Slack mrkdwn has no math support.
+    text = _LATEX_BLOCK_RE.sub(
+        lambda m: m.group(0).replace("\\[", "").replace("\\]", "").strip(), text
+    )
+    text = _LATEX_INLINE_RE.sub(
+        lambda m: m.group(0).replace("\\(", "").replace("\\)", "").strip(), text
+    )
+
+    # Run slackify_markdown first so it handles standard **bold**, *italic*,
+    # - bullets, [links], > quotes, etc. before our custom table/fallback rules.
+    try:
+        from slackify_markdown import slackify_markdown
+        text = slackify_markdown(text)
+    except ImportError:
+        # Basic built-in conversion fallback
+        text = _LEFTOVER_BOLD_RE.sub(r"*\1*", text)
+        text = _LEFTOVER_HEADER_RE.sub(r"*\1*", text)
+        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+
+    # Convert Markdown tables AFTER slackify so header *bold* markers survive.
+    text = _TABLE_RE.sub(_table_to_text, text)
+
+    # Protect code blocks from further substitutions.
+    code_blocks: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        code_blocks.append(m.group(0))
+        return f"\x00CB{len(code_blocks) - 1}\x00"
+
+    text = _CODE_FENCE_RE.sub(_stash, text)
+    text = _INLINE_CODE_RE.sub(_stash, text)
+
+    # Post-process: any **bold** that survived → *bold* (Slack mrkdwn format).
+    text = _LEFTOVER_BOLD_RE.sub(r"*\1*", text)
+    text = _LEFTOVER_HEADER_RE.sub(r"*\1*", text)
+
+    # Restore code blocks.
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"\x00CB{i}\x00", block)
+
+    return text
 
 
 class SlackConfig(BaseModel):
@@ -131,13 +210,54 @@ class SlackAdapter(Adapter):
         # Resolve real display name asynchronously
         display_name = await self._resolve_user_name(parsed.sender.id)
         sender = Sender(id=parsed.sender.id, name=display_name)
+
+        # Download Slack file attachments via bot token and save locally.
+        # ``url_private`` requires auth — the LLM can't access it directly,
+        # so we download now and store a local ``path`` that the agent can
+        # read and convert to base64 for the multimodal model.
+        content = parsed.content
+        if content.attachments and self._web is not None:
+            import aiohttp
+
+            cfg: SlackConfig = self.config  # type: ignore[assignment]
+            attachments_dir = (self.store.db_path.parent / "attachments").resolve()
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            new_attachments: list[dict[str, Any]] = []
+            async with aiohttp.ClientSession() as session:
+                for att in content.attachments:
+                    att_dict = att.model_dump()
+                    file_url = att.url
+                    if file_url and file_url.startswith("https://files.slack.com/"):
+                        try:
+                            headers = {"Authorization": f"Bearer {cfg.bot_token}"}
+                            async with session.get(file_url, headers=headers) as resp:
+                                if resp.status == 200:
+                                    file_bytes = await resp.read()
+                                    safe_name = att.name or att.file_id or "file"
+                                    local_path = attachments_dir / f"{att.file_id}_{safe_name}"
+                                    local_path.write_bytes(file_bytes)
+                                    att_dict["path"] = str(local_path)
+                                    log.debug(
+                                        "slack: downloaded %s -> %s (%d bytes)",
+                                        att.file_id, local_path, len(file_bytes),
+                                    )
+                                else:
+                                    log.warning(
+                                        "slack: download %s returned %d",
+                                        file_url, resp.status,
+                                    )
+                        except Exception:
+                            log.exception("slack: download failed for %s", att.file_id)
+                    new_attachments.append(att_dict)
+            content = Content(text=content.text, attachments=new_attachments)
+
         row_id = await self.store.insert_inbound(
             platform=self.name,
             conv_id=parsed.conv_id,
             msg_id=parsed.msg_id,
             ts=parsed.ts,
             sender=sender,
-            content=parsed.content,
+            content=content,
             raw=raw,
         )
         if row_id is not None:
@@ -178,10 +298,12 @@ class SlackAdapter(Adapter):
     def parse_inbound(self, raw: dict[str, Any]) -> ParsedInbound | None:
         # Drop anything that isn't a fresh user message. The set of "weird"
         # message subtypes is open-ended, so we treat ANY ``subtype`` as
-        # non-conversational. This matches what real Slack bots do.
+        # non-conversational — EXCEPT ``file_share``, which represents a user
+        # uploading an image / file alongside (optional) text.
         if raw.get("type") != "message":
             return None
-        if raw.get("subtype"):
+        subtype = raw.get("subtype")
+        if subtype and subtype != "file_share":
             return None
         # Bot's own messages echo through the events API; without this filter
         # an echo agent loops forever.
@@ -199,9 +321,34 @@ class SlackAdapter(Adapter):
         except (TypeError, ValueError):
             return None
 
-        # Sender uses user_id as placeholder; on_event resolves the real name.
+        # Build attachment list from Slack ``files`` array (present on
+        # ``file_share`` events). Map Slack mimetype prefix to linc kind.
+        _MIME_KIND: dict[str, str] = {
+            "image/": "image",
+            "video/": "video",
+            "audio/": "audio",
+        }
+        attachments: list[Any] = []
+        for f in raw.get("files") or []:
+            kind = "file"
+            mime = f.get("mimetype") or ""
+            for prefix, k in _MIME_KIND.items():
+                if mime.startswith(prefix):
+                    kind = k
+                    break
+            attachments.append(
+                dict(
+                    kind=kind,
+                    url=f.get("url_private") or f.get("url_private_download"),
+                    file_id=f.get("id"),
+                    mime=mime or None,
+                    name=f.get("name"),
+                    size=f.get("size"),
+                )
+            )
+
         sender = Sender(id=str(user), name=str(user))
-        content = Content(text=str(text))
+        content = Content(text=str(text), attachments=attachments)
         return ParsedInbound(
             conv_id=str(channel),
             msg_id=str(ts_str),
@@ -220,9 +367,11 @@ class SlackAdapter(Adapter):
         if self._web is None:
             raise SendError("slack adapter not started; call start() first")
         try:
+            mrkdwn_text = _to_slack_mrkdwn(content.text or "")
             resp = await self._web.chat_postMessage(
                 channel=conv_id,
-                text=content.text or "",
+                text=mrkdwn_text,
+                mrkdwn=True,
             )
         except Exception as e:
             raise SendError(f"slack chat_postMessage raised: {e}") from e

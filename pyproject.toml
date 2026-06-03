@@ -20,6 +20,7 @@ dependencies = [
     "chakpy>=0.3.7",
     # Slack: official SDK; AsyncWebClient + SocketModeClient (aiohttp-based) are bundled.
     "slack-sdk>=3.27",
+    "slackify-markdown>=0.2",
     "aiohttp>=3.9",
     # Feishu (Lark): official SDK — WebSocket events + REST API.
     "lark-oapi>=1.4.0",
@@ -51,6 +52,9 @@ packages = ["src/linc"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.uv.sources]
+chakpy = { path = "/Users/zhixiang.xue/zeitro/chak-ai", editable = true }
 
 [tool.uv]
 index-url = "https://mirrors.aliyun.com/pypi/simple/"

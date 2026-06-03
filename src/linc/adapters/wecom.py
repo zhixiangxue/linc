@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from ..core.adapter import Adapter, ParsedInbound
 from ..core.errors import SendError
-from ..core.models import Content, Sender
+from ..core.models import Attachment, Content, Sender
 from . import register
 
 log = logging.getLogger(__name__)
@@ -199,6 +199,22 @@ class WecomAdapter(Adapter):
                 "req_id": frame.get("headers", {}).get("req_id", ""),
             }
 
+            # Extract image / file / mixed attachments so parse_inbound
+            # and on_event can process them.
+            msgtype = raw["msgtype"]
+            if msgtype == "image":
+                img = body.get("image", {})
+                raw["_image"] = {"url": img.get("url", ""), "aeskey": img.get("aeskey", "")}
+            elif msgtype == "file":
+                f = body.get("file", {})
+                raw["_file"] = {
+                    "url": f.get("url", ""),
+                    "aeskey": f.get("aeskey", ""),
+                    "name": f.get("file_name", ""),
+                }
+            elif msgtype == "mixed":
+                raw["_mixed_items"] = body.get("mixed", {}).get("msg_item", [])
+
             # on_event is a coroutine — schedule it
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -208,15 +224,124 @@ class WecomAdapter(Adapter):
         except Exception:
             log.exception("wecom adapter: _on_message failed")
 
-    def parse_inbound(self, raw: dict[str, Any]) -> ParsedInbound | None:
-        # Only handle text messages in v0.1
-        msgtype = raw.get("msgtype", "")
-        if msgtype != "text":
+    async def on_event(self, raw: dict[str, Any]) -> int | None:
+        """Override to download WeCom attachments before persisting."""
+        parsed = self.parse_inbound(raw)
+        if parsed is None:
             return None
 
-        text = raw.get("text_content", "")
-        if not text:
+        content = parsed.content
+        if content.attachments and self._client is not None:
+            attachments_dir = (self.store.db_path.parent / "attachments").resolve()
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            new_attachments: list[Attachment] = []
+            for att in content.attachments:
+                att_dict = att.model_dump()
+                url = att.url
+                aeskey = att.meta.get("aeskey", "") if att.meta else ""
+                if url and aeskey:
+                    try:
+                        data, filename = await self._client.download_file(url, aeskey)
+                        safe_name = filename or att.name or att.file_id or "file"
+                        local_path = attachments_dir / f"{att.file_id}_{safe_name}"
+                        local_path.write_bytes(data)
+                        att_dict["path"] = str(local_path)
+                        log.debug(
+                            "wecom: downloaded %s -> %s (%d bytes)",
+                            att.file_id, local_path, len(data),
+                        )
+                    except Exception:
+                        log.exception("wecom: download failed for %s", att.file_id)
+                new_attachments.append(Attachment(**att_dict))
+            content = Content(text=content.text, attachments=new_attachments)
+
+        sender = Sender(
+            id=parsed.sender.id,
+            name=parsed.sender.name or parsed.sender.id,
+        )
+        row_id = await self.store.insert_inbound(
+            platform=self.name,
+            conv_id=parsed.conv_id,
+            msg_id=parsed.msg_id,
+            ts=parsed.ts,
+            sender=sender,
+            content=content,
+            raw=raw,
+        )
+        if row_id is not None:
+            text_preview = (content.text or "")[:80]
+            log.info(
+                "\u2b07 [%s] %s | %s (%s): %s",
+                self.name, parsed.conv_id, sender.name, sender.id, text_preview,
+            )
+        return row_id
+
+    def parse_inbound(self, raw: dict[str, Any]) -> ParsedInbound | None:
+        msgtype = raw.get("msgtype", "")
+
+        # Build text from the most relevant source for this message type.
+        text = ""
+        if msgtype == "text":
+            text = raw.get("text_content", "")
+        elif msgtype == "image":
+            text = "[图片]"
+        elif msgtype == "file":
+            name = raw.get("_file", {}).get("name", "")
+            text = f"[文件: {name}]" if name else "[文件]"
+        elif msgtype == "mixed":
+            for item in raw.get("_mixed_items", []):
+                if item.get("msgtype") == "text":
+                    text = item.get("text", {}).get("content", "")
+                    break
+        else:
             return None
+
+        if not text and msgtype == "text":
+            return None
+
+        # Build attachment list for non-text media.
+        attachments: list[Attachment] = []
+        if msgtype == "image":
+            img = raw.get("_image", {})
+            if img.get("url"):
+                attachments.append(Attachment(
+                    kind="image",
+                    url=img["url"],
+                    file_id=raw.get("msgid", ""),
+                    meta={"aeskey": img.get("aeskey", "")},
+                ))
+        elif msgtype == "file":
+            f = raw.get("_file", {})
+            if f.get("url"):
+                attachments.append(Attachment(
+                    kind="file",
+                    url=f["url"],
+                    name=f.get("name", ""),
+                    file_id=raw.get("msgid", ""),
+                    meta={"aeskey": f.get("aeskey", "")},
+                ))
+        elif msgtype == "mixed":
+            for item in raw.get("_mixed_items", []):
+                item_type = item.get("msgtype", "")
+                if item_type == "image":
+                    img = item.get("image", {})
+                    if img.get("url"):
+                        attachments.append(Attachment(
+                            kind="image",
+                            url=img["url"],
+                            file_id=item.get("msgid", ""),
+                            meta={"aeskey": img.get("aeskey", "")},
+                        ))
+                elif item_type == "file":
+                    f = item.get("file", {})
+                    if f.get("url"):
+                        attachments.append(Attachment(
+                            kind="file",
+                            url=f["url"],
+                            name=f.get("file_name", ""),
+                            file_id=item.get("msgid", ""),
+                            meta={"aeskey": f.get("aeskey", "")},
+                        ))
 
         chattype = raw.get("chattype", "")
         from_userid = raw.get("from_userid", "")
@@ -237,7 +362,7 @@ class WecomAdapter(Adapter):
             id=from_userid,
             name=raw.get("from_name", "") or from_userid,
         )
-        content = Content(text=text)
+        content = Content(text=text, attachments=attachments)
 
         return ParsedInbound(
             conv_id=conv_id,
