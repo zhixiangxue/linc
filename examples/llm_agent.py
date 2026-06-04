@@ -14,14 +14,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 import chak
 
-from linc import Linc
+from linc import Client
+from linc.core.models import Attachment
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("llm_agent")
 
 SYSTEM_PROMPT = """你是 LINC 示例里的聊天助手。
@@ -86,79 +91,127 @@ async def ask_llm(
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Attachment conversion helpers
+# ---------------------------------------------------------------------------
+
+_KIND_MAP = {
+    "image": chak.Image,
+    "audio": chak.Audio,
+    "video": chak.Video,
+}
+
+
+def convert_attachments(attachments: list[Attachment]) -> list:
+    """Convert linc Attachments to chak attachment objects for LLM consumption.
+
+    Uses Attachment convenience properties (is_image, is_audio, is_video, data_uri)
+    for clean type resolution and base64 encoding.
+    """
+    result: list = []
+    for att in attachments:
+        if att.is_image:
+            kind = "image"
+        elif att.is_audio:
+            kind = "audio"
+        elif att.is_video:
+            kind = "video"
+        else:
+            continue
+        url = att.data_uri or att.url
+        if url:
+            result.append(_KIND_MAP[kind](url))
+    return result
+
+
+def _is_placeholder(text: str) -> bool:
+    """Return True if text is a platform-generated placeholder like [图片] or [文件: xx]."""
+    t = text.strip()
+    return bool(t) and t.startswith("[") and t.endswith("]")
+
+
+# ---------------------------------------------------------------------------
+# Debounce buffer config
+# ---------------------------------------------------------------------------
+
+DEBOUNCE_SECONDS = 3.0
+"""Wait this long after the last message in a conversation before processing."""
+
+
 async def main() -> None:
     api_key = get_api_key()
     conversations: dict[tuple[str, str], chak.Conversation] = {}
 
-    async with Linc(".linc") as linc:
-        log.info("llm agent started with %s; waiting for unread messages...", MODEL_URI)
+    # Per-conversation debounce buffer.
+    # key = (platform, conv_id)
+    # value = {"messages": [...], "last_ts": float}
+    pending: dict[tuple[str, str], dict] = {}
+
+    async with Client(".linc") as client:
+        log.info("llm agent started with %s; debounce=%.1fs", MODEL_URI, DEBOUNCE_SECONDS)
         while True:
-            unread = await linc.read_unread_all()
+            unread = await client.read_unread()
+            now = time.time()
+
+            # 1) Incoming messages -> buffer
             for message in unread:
                 if message.sender.is_bot:
                     continue
-                text = message.content.text or ""
+                has_text = bool((message.content.text or "").strip())
                 has_attachments = bool(message.content.attachments)
+                if not has_text and not has_attachments:
+                    continue
+                key = (message.platform, message.conv_id)
+                if key not in pending:
+                    pending[key] = {"messages": [], "last_ts": now}
+                pending[key]["messages"].append(message)
+                pending[key]["last_ts"] = now
 
-                # Skip messages that have neither text nor attachments.
-                if not text.strip() and not has_attachments:
+            # 2) Process conversations whose buffer has been quiet >= DEBOUNCE_SECONDS
+            ready_keys = [
+                k for k, v in pending.items()
+                if now - v["last_ts"] >= DEBOUNCE_SECONDS
+            ]
+
+            for key in ready_keys:
+                batch = pending.pop(key)
+                messages = batch["messages"]
+
+                # Merge text and attachments from all messages in the batch
+                texts: list[str] = []
+                all_attachments: list[Attachment] = []
+                for msg in messages:
+                    t = (msg.content.text or "").strip()
+                    if t and not _is_placeholder(t):
+                        texts.append(t)
+                    all_attachments.extend(msg.content.attachments)
+
+                if not texts and not all_attachments:
                     continue
 
-                # Convert linc Attachment -> chak attachment by kind.
-                # Supported: image → chak.Image, audio → chak.Audio,
-                # video → chak.Video. Other types (file, etc.) are skipped
-                # for now — most LLMs only accept media types.
-                # If a local ``path`` is available (downloaded by the adapter),
-                # read the file and encode as base64 data URI so the LLM's
-                # server can access it without auth.
-                _KIND_MAP = {
-                    "image": chak.Image,
-                    "audio": chak.Audio,
-                    "video": chak.Video,
-                }
-                chak_attachments: list = []
-                for att in message.content.attachments:
-                    if att.kind not in _KIND_MAP:
-                        continue
-                    url = None
-                    if att.path:
-                        try:
-                            import base64 as _b64
-                            from pathlib import Path as _Path
-                            data = _Path(att.path).read_bytes()
-                            b64 = _b64.b64encode(data).decode("ascii")
-                            mime = att.mime or "application/octet-stream"
-                            url = f"data:{mime};base64,{b64}"
-                            log.debug("loaded local file %s (%d bytes)", att.path, len(data))
-                        except Exception:
-                            log.exception("failed to read local file %s", att.path)
-                    if not url:
-                        url = att.url
-                    if url:
-                        chak_attachments.append(_KIND_MAP[att.kind](url))
+                # Convert attachments for LLM
+                chak_attachments = convert_attachments(all_attachments)
 
-                conversation_key = (message.platform, message.conv_id)
-                conversation = conversations.get(conversation_key)
+                # Get or create conversation
+                platform, conv_id = key
+                conversation = conversations.get(key)
                 if conversation is None:
                     conversation = new_conversation(api_key)
-                    conversations[conversation_key] = conversation
+                    conversations[key] = conversation
 
-                human_text = text.strip() or "请处理这个附件"
+                human_text = "\n".join(texts) if texts else "请处理这个附件"
                 reply = await ask_llm(conversation, human_text, chak_attachments or None)
                 if not reply:
                     reply = "我暂时没有生成有效回复，请再试一次。"
 
-                client = linc.get(message.platform)
-                sender = message.sender.name or message.sender.id
+                messenger = client.messenger(platform)
+                sender = messages[0].sender.name or messages[0].sender.id
                 log.info(
-                    "[%s/%s] %s (%s) -> %s",
-                    message.platform,
-                    message.conv_id,
-                    sender,
-                    message.sender.id,
-                    reply,
+                    "[%s/%s] %s -> %s (merged %d msgs)",
+                    platform, conv_id, sender, reply[:100], len(messages),
                 )
-                await client.send(reply, conv_id=message.conv_id)
+                await messenger.send(reply, conv_id=conv_id)
+
             await asyncio.sleep(1.0)
 
 

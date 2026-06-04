@@ -356,8 +356,8 @@ wheels = [
 
 [[package]]
 name = "chakpy"
-version = "0.4.0"
-source = { editable = "/Users/zhixiang.xue/zeitro/chak-ai" }
+version = "0.4.1"
+source = { editable = "../chak-ai" }
 dependencies = [
     { name = "anthropic" },
     { name = "boto3" },
@@ -1020,7 +1020,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "aiorun", specifier = ">=2024.8.1" },
     { name = "aiosqlite", specifier = ">=0.20.0" },
-    { name = "chakpy", editable = "/Users/zhixiang.xue/zeitro/chak-ai" },
+    { name = "chakpy", editable = "../chak-ai" },
     { name = "dingtalk-stream", specifier = ">=0.24" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "lark-oapi", specifier = ">=1.4.0" },

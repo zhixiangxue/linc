@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 
 from ..core.adapter import Adapter, ParsedInbound
 from ..core.errors import SendError
-from ..core.models import Content, Sender
+from ..core.models import Attachment, Content, Sender
 from . import register
 
 log = logging.getLogger(__name__)
@@ -99,6 +99,13 @@ class DingtalkAdapter(Adapter):
                         "robot_code": incoming.robot_code or "",
                         "session_webhook": incoming.session_webhook or "",
                     }
+                    # Extract image download codes for picture / richText messages
+                    if incoming.message_type == "picture":
+                        raw["_image_codes"] = incoming.get_image_list() or []
+                    elif incoming.message_type == "richText":
+                        raw["_image_codes"] = incoming.get_image_list() or []
+                        # Also collect text fragments from richText
+                        raw["_rich_texts"] = incoming.get_text_list() or []
                     await adapter.on_event(raw)
                 except Exception:
                     log.exception("dingtalk adapter: process callback failed")
@@ -205,14 +212,123 @@ class DingtalkAdapter(Adapter):
 
     # ----------------------------------------------------------------- inbound
 
-    def parse_inbound(self, raw: dict[str, Any]) -> ParsedInbound | None:
-        text = raw.get("text", "")
-        if not text:
+    async def on_event(self, raw: dict[str, Any]) -> int | None:
+        """Override to download DingTalk image attachments before persisting."""
+        parsed = self.parse_inbound(raw)
+        if parsed is None:
             return None
 
-        # Only handle text messages in v0.1
+        content = parsed.content
+        # Download images referenced by download_code
+        if content.attachments:
+            attachments_dir = (self.store.db_path.parent / "attachments").resolve()
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            new_attachments: list[Attachment] = []
+            for att in content.attachments:
+                att_dict = att.model_dump()
+                download_code = att.meta.get("download_code", "") if att.meta else ""
+                if download_code:
+                    try:
+                        download_url = await self._get_image_download_url(download_code)
+                        if download_url:
+                            async with httpx.AsyncClient() as client:
+                                resp = await client.get(download_url, timeout=30)
+                                resp.raise_for_status()
+                                data = resp.content
+                            safe_name = att.file_id or download_code[:12]
+                            local_path = attachments_dir / f"{safe_name}.png"
+                            local_path.write_bytes(data)
+                            att_dict["path"] = str(local_path)
+                            att_dict["mime"] = "image/png"
+                            log.debug(
+                                "dingtalk: downloaded image %s -> %s (%d bytes)",
+                                download_code[:12], local_path, len(data),
+                            )
+                    except Exception:
+                        log.exception("dingtalk: image download failed for %s", download_code[:12])
+                new_attachments.append(Attachment(**att_dict))
+            content = Content(text=content.text, attachments=new_attachments)
+
+        row_id = await self.store.insert_inbound(
+            platform=self.name,
+            conv_id=parsed.conv_id,
+            msg_id=parsed.msg_id,
+            ts=parsed.ts,
+            sender=parsed.sender,
+            content=content,
+            raw=raw,
+        )
+        if row_id is not None:
+            text_preview = (content.text or "")[:80]
+            log.info(
+                "\u2b07 [%s] %s | %s (%s): %s",
+                self.name, parsed.conv_id,
+                parsed.sender.name or parsed.sender.id, parsed.sender.id,
+                text_preview,
+            )
+        return row_id
+
+    async def _get_image_download_url(self, download_code: str) -> str | None:
+        """Call DingTalk OpenAPI to exchange download_code for a temporary download URL."""
+        if self._stream_client is None:
+            return None
+        access_token = self._stream_client.get_access_token()
+        if not access_token:
+            log.error("dingtalk: cannot get access_token for image download")
+            return None
+        url = f"{DINGTALK_API}/v1.0/robot/messageFiles/download"
+        headers = {
+            "x-acs-dingtalk-access-token": access_token,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "robotCode": self._robot_code,
+            "downloadCode": download_code,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, headers=headers, json=payload, timeout=15)
+                resp.raise_for_status()
+                return resp.json().get("downloadUrl", "")
+        except Exception:
+            log.exception("dingtalk: get_image_download_url failed")
+            return None
+
+    def parse_inbound(self, raw: dict[str, Any]) -> ParsedInbound | None:
         msg_type = raw.get("message_type", "")
-        if msg_type and msg_type != "text":
+
+        # Build text and attachments based on message type
+        text = ""
+        attachments: list[Attachment] = []
+
+        if msg_type == "text":
+            text = raw.get("text", "")
+            if not text:
+                return None
+        elif msg_type == "picture":
+            text = "[图片]"
+            for code in raw.get("_image_codes", []):
+                attachments.append(Attachment(
+                    kind="image",
+                    file_id=raw.get("message_id", ""),
+                    meta={"download_code": code},
+                ))
+        elif msg_type == "richText":
+            # Combine text fragments from richText
+            rich_texts = raw.get("_rich_texts", [])
+            text = "\n".join(rich_texts) if rich_texts else ""
+            for code in raw.get("_image_codes", []):
+                attachments.append(Attachment(
+                    kind="image",
+                    file_id=raw.get("message_id", ""),
+                    meta={"download_code": code},
+                ))
+            if not text and not attachments:
+                return None
+        else:
+            # Unsupported message type
+            if msg_type:
+                log.debug("dingtalk: skipping unsupported msgtype=%s", msg_type)
             return None
 
         conversation_type = raw.get("conversation_type", "")
@@ -237,7 +353,7 @@ class DingtalkAdapter(Adapter):
             id=sender_staff_id,
             name=raw.get("sender_nick", "") or sender_staff_id,
         )
-        content = Content(text=text)
+        content = Content(text=text, attachments=attachments)
 
         return ParsedInbound(
             conv_id=conv_id,
@@ -270,14 +386,15 @@ class DingtalkAdapter(Adapter):
         }
 
         # Determine target type from conv_id prefix
+        # Use sampleMarkdown so LLM responses render formatting correctly.
         if conv_id.startswith("user:"):
             user_id = conv_id[5:]
             url = f"{DINGTALK_API}/v1.0/robot/oToMessages/batchSend"
             payload = {
                 "robotCode": self._robot_code,
                 "userIds": [user_id],
-                "msgKey": "sampleText",
-                "msgParam": f'{{"content": {_json_escape(text)}}}',
+                "msgKey": "sampleMarkdown",
+                "msgParam": json.dumps({"title": "消息", "text": text}, ensure_ascii=False),
             }
         elif conv_id.startswith("group:"):
             group_id = conv_id[6:]
@@ -285,8 +402,8 @@ class DingtalkAdapter(Adapter):
             payload = {
                 "robotCode": self._robot_code,
                 "openConversationId": group_id,
-                "msgKey": "sampleText",
-                "msgParam": f'{{"content": {_json_escape(text)}}}',
+                "msgKey": "sampleMarkdown",
+                "msgParam": json.dumps({"title": "消息", "text": text}, ensure_ascii=False),
             }
         else:
             raise SendError(f"dingtalk adapter: invalid conv_id format: {conv_id!r}")

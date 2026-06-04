@@ -1,6 +1,6 @@
 """linc — IM Gateway daemon for LLM Agents."""
 
-from .client import Client, Linc
+from .client import Client, Messenger
 from .core.models import (
     Attachment,
     Content,
@@ -13,8 +13,8 @@ from .core.models import (
 __version__ = "0.1.0dev0"
 
 __all__ = [
-    "Linc",
     "Client",
+    "Messenger",
     "Content",
     "Attachment",
     "Sender",

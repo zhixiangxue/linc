@@ -1,4 +1,4 @@
-"""End-to-end tests: a real ``LincGateway`` running alongside a real ``Linc``
+"""End-to-end tests: a real ``LincGateway`` running alongside a real ``Client``
 agent client in the same process, mediated only by SQLite + the two flocks.
 
 These tests exist to verify the **architectural promise**:
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from linc import Linc
+from linc import Client
 from linc.adapters import register, unregister
 from linc.core.config import LincConfig
 from linc.gateway import LincGateway
@@ -70,7 +70,7 @@ async def test_gateway_and_client_locks_coexist(cfg, fake_registered):
     await gateway.start()
     try:
         # Agent client must be able to enter while gateway runs.
-        async with Linc(cfg.data_dir):
+        async with Client(cfg.data_dir):
             assert (cfg.data_dir / "linc.pid").exists()
             assert (cfg.data_dir / "agent.lock").exists()
     finally:
@@ -95,11 +95,11 @@ async def test_inbound_adapter_to_client(cfg, fake_registered):
                 "text": "ping",
             }
         )
-        async with Linc(cfg.data_dir) as linc:
-            msgs = await linc.fake().read_unread()
+        async with Client(cfg.data_dir) as client:
+            msgs = await client.fake.read_unread()
             assert [m.content.text for m in msgs] == ["ping"]
             # Claimed exactly once.
-            again = await linc.fake().read_unread()
+            again = await client.fake.read_unread()
             assert again == []
     finally:
         await gateway.stop()
@@ -114,8 +114,8 @@ async def test_outbound_client_to_adapter(cfg, fake_registered):
     await gateway.start()
     try:
         adapter = gateway.adapters["fake"]
-        async with Linc(cfg.data_dir) as linc:
-            row_id = await linc.fake().send("hello there", conv_id="C42")
+        async with Client(cfg.data_dir) as client:
+            row_id = await client.fake.send("hello there", conv_id="C42")
             assert row_id > 0
 
         # The dispatcher (poll_interval_ms=20) should pick it up almost instantly.
@@ -152,8 +152,8 @@ async def test_echo_agent_loop(cfg, fake_registered):
         stop = asyncio.Event()
 
         async def echo_agent() -> None:
-            async with Linc(cfg.data_dir) as linc:
-                fake = linc.fake()
+            async with Client(cfg.data_dir) as client:
+                fake = client.fake
                 # Tight loop for the test — production agents would back off.
                 while not stop.is_set():
                     msgs = await fake.read_unread()
@@ -214,10 +214,10 @@ async def test_history_contains_both_directions_after_loop(cfg, fake_registered)
                 "text": "ping",
             }
         )
-        async with Linc(cfg.data_dir) as linc:
-            msgs = await linc.fake().read_unread()
+        async with Client(cfg.data_dir) as client:
+            msgs = await client.fake.read_unread()
             assert msgs[0].content.text == "ping"
-            await linc.fake().send("pong", conv_id="C1")
+            await client.fake.send("pong", conv_id="C1")
 
         await _wait_until(lambda: len(adapter.sent) == 1, timeout=2.0)
 

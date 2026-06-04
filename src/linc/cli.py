@@ -25,7 +25,7 @@ from typing import Any
 
 import typer
 
-from .client import Linc
+from .client import Client
 from .core.errors import AlreadyRunning, LincError
 from .core.models import InboundMessage, OutboundMessage
 from .core.store import SqliteStore
@@ -249,9 +249,9 @@ def send(
 
     async def _run() -> None:
         try:
-            async with Linc(data_dir) as linc:
-                client = linc.get(platform)
-                row_id = await client.send(text, conv_id=conv_id)
+            async with Client(data_dir) as client:
+                messenger = client.messenger(platform)
+                row_id = await messenger.send(text, conv_id=conv_id)
         except AlreadyRunning as e:
             _die(str(e))
         except ValueError as e:

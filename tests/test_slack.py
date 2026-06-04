@@ -159,7 +159,7 @@ async def test_send_calls_chat_postMessage_with_correct_args():
 
     msg_id, raw = await adapter.send("C1", Content(text="hi there"))
 
-    adapter._web.chat_postMessage.assert_awaited_once_with(channel="C1", text="hi there")
+    adapter._web.chat_postMessage.assert_awaited_once_with(channel="C1", text="hi there", mrkdwn=True)
     assert msg_id == "1700000000.111"
     assert raw["ok"] is True
     assert raw["ts"] == "1700000000.111"
@@ -171,7 +171,7 @@ async def test_send_empty_text_falls_back_to_empty_string():
     adapter._web.chat_postMessage = AsyncMock(return_value=_ok_response())
 
     await adapter.send("C1", Content(text=""))
-    adapter._web.chat_postMessage.assert_awaited_once_with(channel="C1", text="")
+    adapter._web.chat_postMessage.assert_awaited_once_with(channel="C1", text="", mrkdwn=True)
 
 
 async def test_send_raises_send_error_when_not_started():

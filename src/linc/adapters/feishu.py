@@ -23,10 +23,21 @@ from pydantic import BaseModel, Field
 
 from ..core.adapter import Adapter, ParsedInbound
 from ..core.errors import SendError
-from ..core.models import Content, Sender
+from ..core.models import Attachment, Content, Sender
 from . import register
 
 log = logging.getLogger(__name__)
+
+
+def _guess_ext(kind: str, name: str | None) -> str:
+    """Guess file extension for a downloaded resource."""
+    if name:
+        from pathlib import PurePosixPath
+        ext = PurePosixPath(name).suffix
+        if ext:
+            return ext
+    # Fallback by kind
+    return {"image": ".png", "audio": ".ogg", "video": ".mp4", "file": ".bin"}.get(kind, ".bin")
 
 
 class FeishuConfig(BaseModel):
@@ -193,7 +204,8 @@ class FeishuAdapter(Adapter):
 
             # Schedule on_event in LINC's main asyncio loop.
             if self._loop is not None and self._loop.is_running():
-                self._loop.create_task(self.on_event(raw))
+                task = self._loop.create_task(self.on_event(raw))
+                task.add_done_callback(self._task_done_cb)
             else:
                 log.warning("feishu adapter: event loop not running, dropping message")
         except Exception:
@@ -217,7 +229,12 @@ class FeishuAdapter(Adapter):
             .build()
         )
         try:
-            response = await self._lark_client.contact.v3.user.aget(request)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._lark_client.contact.v3.user.get, request
+                ),
+                timeout=10.0,
+            )
             if not response.success():
                 log.warning(
                     "feishu adapter: contact.v3.user.get failed for %s: code=%s msg=%s",
@@ -250,12 +267,59 @@ class FeishuAdapter(Adapter):
             self._user_cache[user_id] = user_id
             return user_id
 
+    @staticmethod
+    def _task_done_cb(task: asyncio.Task) -> None:
+        """Log unhandled exceptions from on_event tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("feishu on_event task failed: %s", exc, exc_info=exc)
+
     async def on_event(self, raw: dict[str, Any]) -> int | None:
-        """Override to resolve Feishu user display name before persisting."""
+        """Override to resolve user name and download media before persisting."""
+        log.info("feishu on_event: processing msg_type=%s msg_id=%s", raw.get("message_type"), raw.get("message_id", "")[:8])
         parsed = self.parse_inbound(raw)
         if parsed is None:
+            log.warning("feishu on_event: parse_inbound returned None for msg_type=%s", raw.get("message_type"))
             return None
-
+        log.info("feishu on_event: parsed ok, text=%r attachments=%d", (parsed.content.text or "")[:40], len(parsed.content.attachments))
+    
+        # Download media attachments
+        content = parsed.content
+        if content.attachments and self._lark_client is not None:
+            attachments_dir = (self.store.db_path.parent / "attachments").resolve()
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            message_id = raw.get("message_id", "")
+            new_attachments: list[Attachment] = []
+            for att in content.attachments:
+                att_dict = att.model_dump()
+                file_key = att.meta.get("file_key", "") if att.meta else ""
+                if file_key and message_id:
+                    try:
+                        resource_type = "image" if att.kind == "image" else "file"
+                        data = await self._download_resource(
+                            message_id, file_key, resource_type
+                        )
+                        if data:
+                            ext = _guess_ext(att.kind, att.name)
+                            safe_name = f"{message_id}_{file_key[:8]}{ext}"
+                            local_path = attachments_dir / safe_name
+                            local_path.write_bytes(data)
+                            att_dict["path"] = str(local_path)
+                            if not att_dict.get("mime"):
+                                import mimetypes
+                                mime, _ = mimetypes.guess_type(safe_name)
+                                att_dict["mime"] = mime
+                            log.debug(
+                                "feishu: downloaded %s %s -> %s (%d bytes)",
+                                resource_type, file_key[:8], local_path, len(data),
+                            )
+                    except Exception:
+                        log.exception("feishu: download failed for %s", file_key[:8])
+                new_attachments.append(Attachment(**att_dict))
+            content = Content(text=content.text, attachments=new_attachments)
+    
         display_name = await self._resolve_user_name(parsed.sender.id)
         sender = Sender(id=parsed.sender.id, name=display_name)
         row_id = await self.store.insert_inbound(
@@ -264,13 +328,13 @@ class FeishuAdapter(Adapter):
             msg_id=parsed.msg_id,
             ts=parsed.ts,
             sender=sender,
-            content=parsed.content,
+            content=content,
             raw=raw,
         )
         if row_id is not None:
-            text_preview = (parsed.content.text or "")[:80]
+            text_preview = (content.text or "")[:80]
             log.info(
-                "⬇ [%s] %s | %s (%s): %s",
+                "\u2b07 [%s] %s | %s (%s): %s",
                 self.name,
                 parsed.conv_id,
                 display_name,
@@ -278,29 +342,160 @@ class FeishuAdapter(Adapter):
                 text_preview,
             )
         return row_id
-
+    
+    async def _download_resource(
+        self, message_id: str, file_key: str, resource_type: str
+    ) -> bytes | None:
+        """Download a message resource using the Feishu REST API."""
+        from lark_oapi.api.im.v1.model.get_message_resource_request import (
+            GetMessageResourceRequest,
+        )
+    
+        req = (
+            GetMessageResourceRequest.builder()
+            .message_id(message_id)
+            .file_key(file_key)
+            .type(resource_type)
+            .build()
+        )
+        try:
+            log.info("feishu: downloading resource msg_id=%s file_key=%s type=%s", message_id[:8], file_key[:8], resource_type)
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._lark_client.im.v1.message_resource.get, req
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            log.error("feishu: download_resource timed out (30s): msg_id=%s file_key=%s", message_id[:8], file_key[:8])
+            return None
+        except Exception:
+            log.exception("feishu: download_resource request failed")
+            return None
+        code = getattr(resp, "code", None)
+        if code is not None and code != 0:
+            log.warning(
+                "feishu: download_resource failed: msg_id=%s file_key=%s code=%s msg=%s",
+                message_id, file_key, code, getattr(resp, "msg", ""),
+            )
+            return None
+        f = getattr(resp, "file", None)
+        if hasattr(f, "read"):
+            return f.read()
+        if isinstance(f, (bytes, bytearray)):
+            return bytes(f)
+        return None
+    
     def parse_inbound(self, raw: dict[str, Any]) -> ParsedInbound | None:
         # Filter out bot's own messages
         if raw.get("sender_type") == "app":
             return None
-
-        # Only handle text messages in v0.1
-        message_type = raw.get("message_type")
+    
+        import json as json_mod
+    
+        message_type = raw.get("message_type", "")
         content_str = raw.get("content") or ""
-
-        # Parse content JSON — text messages are {"text": "hello"}
+    
         text = ""
-        if content_str:
-            import json
-            try:
-                content_data = json.loads(content_str)
-                text = content_data.get("text", "")
-            except (json.JSONDecodeError, TypeError):
-                text = content_str
-
-        if not text:
+        attachments: list[Attachment] = []
+    
+        if not content_str:
             return None
-
+    
+        try:
+            content_data = json_mod.loads(content_str)
+        except (json_mod.JSONDecodeError, TypeError):
+            return None
+    
+        if message_type == "text":
+            text = content_data.get("text", "")
+            if not text:
+                return None
+    
+        elif message_type == "image":
+            image_key = content_data.get("image_key", "")
+            text = "[图片]"
+            if image_key:
+                attachments.append(Attachment(
+                    kind="image",
+                    file_id=raw.get("message_id", ""),
+                    meta={"file_key": image_key},
+                ))
+    
+        elif message_type == "file":
+            file_key = content_data.get("file_key", "")
+            file_name = content_data.get("file_name", "")
+            text = f"[文件: {file_name}]" if file_name else "[文件]"
+            if file_key:
+                import mimetypes
+                mime, _ = mimetypes.guess_type(file_name)
+                attachments.append(Attachment(
+                    kind="file",
+                    name=file_name,
+                    mime=mime,
+                    file_id=raw.get("message_id", ""),
+                    meta={"file_key": file_key},
+                ))
+    
+        elif message_type == "audio":
+            file_key = content_data.get("file_key", "")
+            text = "[语音]"
+            if file_key:
+                attachments.append(Attachment(
+                    kind="audio",
+                    file_id=raw.get("message_id", ""),
+                    meta={"file_key": file_key},
+                ))
+    
+        elif message_type == "post":
+            # Rich text (post) messages - may be either:
+            # 1. Direct: {"title": "...", "content": [[...]]}
+            # 2. Lang-wrapped: {"zh_cn": {"title": "...", "content": [[...]]}}
+            texts_parts: list[str] = []
+            post_body = None
+            if "content" in content_data:
+                # Direct structure
+                post_body = content_data
+            else:
+                # Language-wrapped structure
+                for lang_key in ("zh_cn", "en_us", "ja_jp"):
+                    post_body = content_data.get(lang_key)
+                    if post_body:
+                        break
+            if post_body:
+                title = post_body.get("title", "")
+                if title:
+                    texts_parts.append(title)
+                for paragraph in post_body.get("content", []):
+                    for element in paragraph:
+                        tag = element.get("tag", "")
+                        if tag == "text":
+                            t = element.get("text", "").strip()
+                            if t:
+                                texts_parts.append(t)
+                        elif tag == "img":
+                            image_key = element.get("image_key", "")
+                            if image_key:
+                                attachments.append(Attachment(
+                                    kind="image",
+                                    file_id=raw.get("message_id", ""),
+                                    meta={"file_key": image_key},
+                                ))
+                        elif tag == "a":
+                            link_text = element.get("text", "")
+                            href = element.get("href", "")
+                            if link_text:
+                                texts_parts.append(f"{link_text}({href})" if href else link_text)
+            text = "\n".join(texts_parts) if texts_parts else ""
+            if not text and not attachments:
+                return None
+    
+        else:
+            # Unsupported message type
+            if message_type:
+                log.debug("feishu: skipping unsupported message_type=%s", message_type)
+            return None
+    
         # Determine conv_id
         chat_type = raw.get("chat_type", "")
         if chat_type == "group":
@@ -308,21 +503,21 @@ class FeishuAdapter(Adapter):
         else:
             # P2P: use sender's open_id as conv_id
             conv_id = raw.get("sender_id", "")
-
+    
         if not conv_id:
             return None
-
+    
         msg_id = raw.get("message_id", "")
         sender_id = raw.get("sender_id", "")
-
+    
         # Timestamp: create_time is milliseconds string
         try:
             ts = float(raw.get("create_time", "0")) / 1000.0
         except (TypeError, ValueError):
             ts = time.time()
-
+    
         sender = Sender(id=sender_id, name=sender_id)
-        content = Content(text=text)
+        content = Content(text=text, attachments=attachments)
         return ParsedInbound(
             conv_id=conv_id,
             msg_id=msg_id,
@@ -357,7 +552,15 @@ class FeishuAdapter(Adapter):
             receive_id_type = "chat_id"
 
         text = content.text or ""
-        msg_content = json_mod.dumps({"text": text})
+        # Use interactive card with markdown element for rich rendering
+        msg_content = json_mod.dumps({
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": text,
+                }
+            ],
+        }, ensure_ascii=False)
 
         request = (
             CreateMessageRequest.builder()
@@ -366,7 +569,7 @@ class FeishuAdapter(Adapter):
                 CreateMessageRequestBody.builder()
                 .receive_id(conv_id)
                 .content(msg_content)
-                .msg_type("text")
+                .msg_type("interactive")
                 .uuid(str(uuid.uuid4()))
                 .build()
             )

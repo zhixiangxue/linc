@@ -1,36 +1,35 @@
-"""Agent-side SDK: ``Linc`` context manager + ``Client`` handle.
+"""Agent-side SDK: ``Client`` context manager + ``Messenger`` handle.
 
 Typical usage in an agent script (NOT inside the gateway process)::
 
-    async with Linc(".linc") as linc:
-        slack = linc.get("slack")
-        unread = await slack.read_unread()
+    async with Client(".linc") as client:
+        unread = await client.slack.read_unread()
         for m in unread:
-            await slack.send(conv_id=m.conv_id, content=f"echo: {m.content.text}")
+            await client.slack.send(conv_id=m.conv_id, content=f"echo: {m.content.text}")
 
 Design notes:
-- ``Linc.__aenter__`` acquires ``agent.lock`` flock so at most one agent process
+- ``Client.__aenter__`` acquires ``agent.lock`` flock so at most one agent process
   talks to a given data_dir at a time. The gateway holds its own ``linc.pid``
   lock; the two are independent — gateway and agent can (and must) coexist.
-- ``linc.get(platform)`` is the preferred explicit way to obtain a platform
-  client. ``linc.<platform>()`` remains as a compatibility alias and is resolved
-  via ``__getattr__`` with adapter registry validation.
+- ``client.messenger(platform)`` is the preferred explicit way to obtain a platform
+  messenger. ``client.<platform>`` is resolved via ``__getattr__`` with adapter
+  registry validation.
 - The client does NOT instantiate adapters and does NOT need ``linc.yaml``. It
   only needs read/write access to the SQLite file at ``<data_dir>/linc.db``.
 - All write operations go through the SAME ``SqliteStore`` API used by the
   gateway, so concurrent gateway + agent are safe (single-writer SQLite via
   asyncio.Lock + WAL).
 
-Naming: ``Client`` is the per-platform SDK façade (a thin, stateless proxy over
-the shared store — same shape as ``boto3.client('s3')``). It does **not** open
-any network connection — that is the gateway-side ``Adapter``'s job.
+Naming: ``Messenger`` is the per-platform SDK façade (a thin, stateless proxy over
+the shared store). It does **not** open any network connection — that is the
+gateway-side ``Adapter``'s job.
 """
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .adapters import is_supported, supported
 from .core.locks import acquire_agent_lock, release
@@ -38,7 +37,7 @@ from .core.models import Content, InboundMessage, OutboundDraft, OutboundMessage
 from .core.store import SqliteStore
 
 
-class Linc:
+class Client:
     """Async context manager — the agent-side entry point."""
 
     def __init__(self, data_dir: str | Path = ".linc") -> None:
@@ -48,7 +47,7 @@ class Linc:
 
     # ------------------------------------------------------------------ lifecycle
 
-    async def __aenter__(self) -> "Linc":
+    async def __aenter__(self) -> "Client":
         self._data_dir.mkdir(parents=True, exist_ok=True)
         # flock first — fails fast if another agent already holds it.
         self._lock_fd = acquire_agent_lock(self._data_dir)
@@ -80,17 +79,16 @@ class Linc:
     @property
     def store(self) -> SqliteStore:
         if self._store is None:
-            raise RuntimeError("Linc not entered; use 'async with Linc(...) as linc'")
+            raise RuntimeError("Client not entered; use 'async with Client(...) as client'")
         return self._store
 
     # ------------------------------------------------------------------ platform factory
 
-    def get(self, platform: str, conv_id: str | None = None) -> "Client":
-        """Return a platform client by name.
+    def messenger(self, platform: str, conv_id: str | None = None) -> "Messenger":
+        """Return a Messenger for the given platform.
 
-        This is the preferred explicit API for multi-platform agents. The
-        dynamic ``linc.slack()``/``linc.feishu()`` factories remain available as
-        compatibility aliases, but new code should prefer ``linc.get(name)``.
+        Use this for dynamic/variable platform names. For static access,
+        prefer the attribute form: ``client.slack``, ``client.feishu``.
         """
         if not is_supported(platform):
             raise ValueError(
@@ -98,13 +96,13 @@ class Linc:
                 f"registered platforms are {sorted(supported())}. "
                 f"Did you forget to import the adapter, or mistype the name?"
             )
-        return Client(name=platform, store=self.store, conv_id=conv_id)
+        return Messenger(name=platform, store=self.store, conv_id=conv_id)
 
-    def __getattr__(self, name: str) -> Callable[..., "Client"]:
-        """Compatibility alias: ``linc.slack()`` / ``linc.feishu()`` ...
+    def __getattr__(self, name: str) -> "Messenger":
+        """Attribute access: ``client.slack`` / ``client.feishu`` ...
 
-        Raises ``AttributeError`` for any name not in the adapter registry, so
-        typos surface at ``linc.wxchat()`` instead of being silently swallowed.
+        Returns a Messenger directly (no call needed). Raises ``AttributeError``
+        for any name not in the adapter registry.
         """
         # Internal / dunder attributes must not be intercepted, else getattr
         # probes (hasattr, copy, pickle, ...) blow up with confusing errors.
@@ -116,15 +114,11 @@ class Linc:
                 f"registered platforms are {sorted(supported())}. "
                 f"Did you forget to import the adapter, or mistype the name?"
             )
-
-        def factory(conv_id: str | None = None) -> "Client":
-            return self.get(name, conv_id=conv_id)
-
-        return factory
+        return Messenger(name=name, store=self.store)
 
     # ------------------------------------------------------------------ cross-platform helpers
 
-    async def read_unread_all(
+    async def read_unread(
         self, limit: int | None = None,
     ) -> list[InboundMessage]:
         """Atomically claim unread messages across **all** platforms."""
@@ -142,14 +136,13 @@ class Linc:
         )
 
 
-class Client:
+class Messenger:
     """Per-platform SDK handle bound to (optionally) a single conversation.
 
-    A thin, stateless proxy over the shared ``SqliteStore`` — in spirit the
-    same shape as ``boto3.client('s3')``: every method just translates to a
-    store call with ``platform=self.name`` (and optional ``conv_id``) filled
-    in. It does NOT open IM connections; that work belongs to the gateway-
-    side ``Adapter``.
+    A thin, stateless proxy over the shared ``SqliteStore`` — every method just
+    translates to a store call with ``platform=self.name`` (and optional
+    ``conv_id``) filled in. It does NOT open IM connections; that work belongs
+    to the gateway-side ``Adapter``.
     """
 
     __slots__ = ("name", "_store", "_conv_id")
@@ -166,9 +159,9 @@ class Client:
 
     # ------------------------------------------------------------------ scope helpers
 
-    def conv(self, conv_id: str) -> "Client":
+    def conv(self, conv_id: str) -> "Messenger":
         """Return a new handle bound to ``conv_id`` (chainable)."""
-        return Client(name=self.name, store=self._store, conv_id=conv_id)
+        return Messenger(name=self.name, store=self._store, conv_id=conv_id)
 
     # ------------------------------------------------------------------ inbound
 
@@ -215,7 +208,7 @@ class Client:
         if cid is None:
             raise ValueError(
                 f"send() requires conv_id (either as argument or bound via "
-                f"linc.{self.name}(conv_id=...))"
+                f"client.{self.name}.conv(conv_id))"
             )
         if isinstance(content, str):
             payload = Content(text=content)
@@ -240,4 +233,4 @@ class Client:
         )
 
 
-__all__ = ["Linc", "Client"]
+__all__ = ["Client", "Messenger"]

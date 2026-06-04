@@ -10,6 +10,9 @@ Conventions:
 
 from __future__ import annotations
 
+import base64 as _b64
+import mimetypes as _mt
+from pathlib import Path as _Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,6 +39,100 @@ class Attachment(BaseModel):
     name: str | None = None
     size: int | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # Convenience properties
+    # ------------------------------------------------------------------
+
+    _IMAGE_EXTS: set[str] = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
+    _AUDIO_EXTS: set[str] = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac"}
+    _VIDEO_EXTS: set[str] = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+    @property
+    def is_image(self) -> bool:
+        """True if this attachment is an image (by kind, MIME, or extension)."""
+        if self.kind == "image":
+            return True
+        if self.kind != "file":
+            return False
+        if self.mime and self.mime.startswith("image/"):
+            return True
+        return self.ext in self._IMAGE_EXTS
+
+    @property
+    def is_audio(self) -> bool:
+        """True if this attachment is audio (by kind, MIME, or extension)."""
+        if self.kind == "audio":
+            return True
+        if self.kind != "file":
+            return False
+        if self.mime and self.mime.startswith("audio/"):
+            return True
+        return self.ext in self._AUDIO_EXTS
+
+    @property
+    def is_video(self) -> bool:
+        """True if this attachment is a video (by kind, MIME, or extension)."""
+        if self.kind == "video":
+            return True
+        if self.kind != "file":
+            return False
+        if self.mime and self.mime.startswith("video/"):
+            return True
+        return self.ext in self._VIDEO_EXTS
+
+    @property
+    def is_media(self) -> bool:
+        """True if image, audio, or video."""
+        return self.is_image or self.is_audio or self.is_video
+
+    @property
+    def ext(self) -> str:
+        """File extension including the dot (e.g. '.png'), or '' if unknown.
+
+        Resolved from `name`, `path`, or guessed from `mime`.
+        """
+        # Try name first
+        if self.name:
+            suffix = _Path(self.name).suffix.lower()
+            if suffix:
+                return suffix
+        # Then path
+        if self.path:
+            suffix = _Path(self.path).suffix.lower()
+            if suffix:
+                return suffix
+        # Fallback: guess from MIME
+        if self.mime:
+            guessed = _mt.guess_extension(self.mime)
+            if guessed:
+                return guessed.lower()
+        return ""
+
+    @property
+    def data_uri(self) -> str | None:
+        """Base64-encoded data URI from local `path`, or None if unavailable.
+
+        Returns e.g. 'data:image/png;base64,iVBOR...' ready for LLM consumption.
+        """
+        if not self.path:
+            return None
+        p = _Path(self.path)
+        if not p.is_file():
+            return None
+        data = p.read_bytes()
+        b64 = _b64.b64encode(data).decode("ascii")
+        mime = self.mime or _mt.guess_type(p.name)[0] or "application/octet-stream"
+        return f"data:{mime};base64,{b64}"
+
+    def read_bytes(self) -> bytes | None:
+        """Read raw file bytes from local `path`, or None if unavailable."""
+        if not self.path:
+            return None
+        p = _Path(self.path)
+        if not p.is_file():
+            return None
+        return p.read_bytes()
 
 
 class Content(BaseModel):

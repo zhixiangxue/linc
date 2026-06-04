@@ -184,36 +184,46 @@ class WecomAdapter(Adapter):
             if not body:
                 return
 
+            msgtype = body.get("msgtype", "")
+            if msgtype and msgtype != "text":
+                log.info("wecom adapter: incoming frame msgtype=%s msgid=%s", msgtype, body.get("msgid", ""))
+            else:
+                log.debug("wecom adapter: incoming frame msgtype=%s msgid=%s", msgtype, body.get("msgid", ""))
+
+            from_info = body.get("from") or {}
+            text_info = body.get("text") or {}
+            headers = frame.get("headers") or {}
+
             raw = {
                 "msgid": body.get("msgid", ""),
-                "msgtype": body.get("msgtype", ""),
+                "msgtype": msgtype,
                 "chattype": body.get("chattype", ""),  # "single" or "group"
                 "chatid": body.get("chatid", ""),
                 "chatname": body.get("chatname", ""),
-                "from_userid": body.get("from", {}).get("userid", ""),
+                "from_userid": from_info.get("userid", ""),
                 "from_name": (
-                    body.get("from", {}).get("alias", "")
-                    or body.get("from", {}).get("name", "")
+                    from_info.get("alias", "")
+                    or from_info.get("name", "")
                 ),
-                "text_content": body.get("text", {}).get("content", ""),
-                "req_id": frame.get("headers", {}).get("req_id", ""),
+                "text_content": text_info.get("content", ""),
+                "req_id": headers.get("req_id", ""),
             }
 
             # Extract image / file / mixed attachments so parse_inbound
             # and on_event can process them.
-            msgtype = raw["msgtype"]
             if msgtype == "image":
-                img = body.get("image", {})
+                img = body.get("image") or {}
                 raw["_image"] = {"url": img.get("url", ""), "aeskey": img.get("aeskey", "")}
             elif msgtype == "file":
-                f = body.get("file", {})
+                f = body.get("file") or {}
                 raw["_file"] = {
                     "url": f.get("url", ""),
                     "aeskey": f.get("aeskey", ""),
                     "name": f.get("file_name", ""),
                 }
             elif msgtype == "mixed":
-                raw["_mixed_items"] = body.get("mixed", {}).get("msg_item", [])
+                mixed = body.get("mixed") or {}
+                raw["_mixed_items"] = mixed.get("msg_item", [])
 
             # on_event is a coroutine — schedule it
             loop = asyncio.get_event_loop()
@@ -313,10 +323,14 @@ class WecomAdapter(Adapter):
         elif msgtype == "file":
             f = raw.get("_file", {})
             if f.get("url"):
+                import mimetypes as _mt
+                fname = f.get("name", "")
+                mime, _ = _mt.guess_type(fname)
                 attachments.append(Attachment(
                     kind="file",
                     url=f["url"],
-                    name=f.get("name", ""),
+                    name=fname,
+                    mime=mime,
                     file_id=raw.get("msgid", ""),
                     meta={"aeskey": f.get("aeskey", "")},
                 ))
