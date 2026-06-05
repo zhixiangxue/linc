@@ -365,17 +365,51 @@ class DingtalkAdapter(Adapter):
 
     # ----------------------------------------------------------------- outbound
 
-    async def send(
+    async def _upload_media(self, file_path: str, media_type: str = "image") -> str:
+        """Upload a local file to DingTalk and return the media_id.
+
+        Uses the SDK's built-in upload_to_dingtalk() method which calls the
+        oapi.dingtalk.com/media/upload endpoint. Returns a media_id in the
+        format '@lADP...' suitable for sampleImageMsg's photoURL field.
+        """
+        if self._stream_client is None:
+            raise SendError("dingtalk adapter not started; cannot upload media")
+
+        from pathlib import Path
+        import mimetypes
+
+        path = Path(file_path)
+        if not path.is_file():
+            raise SendError(f"dingtalk adapter: file not found: {file_path}")
+
+        file_bytes = path.read_bytes()
+        filename = path.name
+        mimetype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+        # SDK's upload_to_dingtalk is synchronous; run in thread pool
+        media_id = await asyncio.to_thread(
+            self._stream_client.upload_to_dingtalk,
+            file_bytes,
+            filetype=media_type,
+            filename=filename,
+            mimetype=mimetype,
+        )
+
+        if not media_id:
+            raise SendError(f"dingtalk adapter: upload_to_dingtalk returned no media_id")
+        log.debug("dingtalk: uploaded %s -> media_id=%s", filename, media_id[:20])
+        return media_id
+
+    async def _send_single(
         self,
         conv_id: str,
-        content: Content,
+        msg_key: str,
+        msg_param: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
+        """Low-level helper: send one robot message to the given conv_id."""
         if self._stream_client is None:
             raise SendError("dingtalk adapter not started; call start() first")
 
-        text = content.text or ""
-
-        # Get access_token from SDK (manages expiry internally)
         access_token = self._stream_client.get_access_token()
         if not access_token:
             raise SendError("dingtalk adapter: failed to get access_token")
@@ -385,16 +419,14 @@ class DingtalkAdapter(Adapter):
             "Content-Type": "application/json",
         }
 
-        # Determine target type from conv_id prefix
-        # Use sampleMarkdown so LLM responses render formatting correctly.
         if conv_id.startswith("user:"):
             user_id = conv_id[5:]
             url = f"{DINGTALK_API}/v1.0/robot/oToMessages/batchSend"
             payload = {
                 "robotCode": self._robot_code,
                 "userIds": [user_id],
-                "msgKey": "sampleMarkdown",
-                "msgParam": json.dumps({"title": "消息", "text": text}, ensure_ascii=False),
+                "msgKey": msg_key,
+                "msgParam": json.dumps(msg_param, ensure_ascii=False),
             }
         elif conv_id.startswith("group:"):
             group_id = conv_id[6:]
@@ -402,8 +434,8 @@ class DingtalkAdapter(Adapter):
             payload = {
                 "robotCode": self._robot_code,
                 "openConversationId": group_id,
-                "msgKey": "sampleMarkdown",
-                "msgParam": json.dumps({"title": "消息", "text": text}, ensure_ascii=False),
+                "msgKey": msg_key,
+                "msgParam": json.dumps(msg_param, ensure_ascii=False),
             }
         else:
             raise SendError(f"dingtalk adapter: invalid conv_id format: {conv_id!r}")
@@ -420,9 +452,134 @@ class DingtalkAdapter(Adapter):
         except Exception as e:
             raise SendError(f"dingtalk send failed: {e}") from e
 
-        # The API returns processQueryKey for async delivery tracking
         msg_id = data.get("processQueryKey", "") or data.get("messageId", "")
         return str(msg_id), data
+
+    async def _resolve_file_ref(self, att: "Attachment") -> tuple[str, str]:
+        """Resolve a non-image file attachment to (media_id, filename).
+
+        Downloads from URL if needed, then uploads to DingTalk.
+        """
+        import os
+        import tempfile
+
+        filename = att.name or "file"
+        if att.path:
+            from pathlib import Path
+            filename = att.name or Path(att.path).name
+            media_id = await self._upload_media(att.path, media_type="file")
+            return media_id, filename
+        elif att.url:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(att.url, timeout=60)
+                resp.raise_for_status()
+                file_data = resp.content
+            suffix = att.ext or ""
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(file_data)
+                tmp_path = tmp.name
+            try:
+                media_id = await self._upload_media(tmp_path, media_type="file")
+                return media_id, filename
+            finally:
+                os.unlink(tmp_path)
+        return "", filename
+
+    async def _resolve_image_ref(self, att: "Attachment") -> str:
+        """Resolve an image attachment to a markdown-embeddable reference.
+
+        Returns a media_id (e.g. '@lADP...') for local files, or the original
+        URL for network images. DingTalk markdown supports both:
+          ![image](@lADPxxx)   — uploaded media_id
+          ![image](https://…)  — public URL
+        """
+        import os
+        import tempfile
+
+        if att.path:
+            return await self._upload_media(att.path, media_type="image")
+        elif att.url:
+            # Download from URL to a temp file, then upload
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(att.url, timeout=30)
+                resp.raise_for_status()
+                img_data = resp.content
+            suffix = att.ext or ".png"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(img_data)
+                tmp_path = tmp.name
+            try:
+                return await self._upload_media(tmp_path, media_type="image")
+            finally:
+                os.unlink(tmp_path)
+        return ""
+
+    async def send(
+        self,
+        conv_id: str,
+        content: Content,
+    ) -> tuple[str, dict[str, Any]]:
+        if self._stream_client is None:
+            raise SendError("dingtalk adapter not started; call start() first")
+
+        text = content.text or ""
+        images = [att for att in content.attachments if att.is_image]
+        files = [att for att in content.attachments if not att.is_image]
+
+        # Resolve all image attachments to embeddable references (media_id or URL)
+        image_refs: list[str] = []
+        for att in images:
+            try:
+                ref = await self._resolve_image_ref(att)
+                if ref:
+                    image_refs.append(ref)
+                else:
+                    log.warning("dingtalk: image attachment has no path or url, skipping")
+            except Exception as e:
+                log.error("dingtalk: failed to resolve image: %s", e)
+
+        # Build a single markdown body with text + embedded images
+        parts: list[str] = []
+        if text:
+            parts.append(text)
+        for ref in image_refs:
+            parts.append(f"![image]({ref})")
+
+        markdown_body = "\n\n".join(parts)
+
+        last_msg_id = ""
+        last_data: dict[str, Any] = {}
+
+        # Send text + images as one unified markdown message
+        if markdown_body:
+            last_msg_id, last_data = await self._send_single(
+                conv_id,
+                msg_key="sampleMarkdown",
+                msg_param={"title": "消息", "text": markdown_body},
+            )
+
+        # Send each file attachment as a separate sampleFile message
+        for att in files:
+            try:
+                media_id, filename = await self._resolve_file_ref(att)
+                if media_id:
+                    last_msg_id, last_data = await self._send_single(
+                        conv_id,
+                        msg_key="sampleFile",
+                        msg_param={"mediaId": media_id, "fileName": filename, "fileType": att.ext.lstrip(".") if att.ext else ""},
+                    )
+            except Exception as e:
+                log.error("dingtalk: failed to send file attachment: %s", e)
+
+        # Fallback: empty content
+        if not markdown_body and not files:
+            last_msg_id, last_data = await self._send_single(
+                conv_id,
+                msg_key="sampleMarkdown",
+                msg_param={"title": "消息", "text": ""},
+            )
+
+        return last_msg_id, last_data
 
 
 def _dingtalk_ws_connect(websockets_module: Any, uri: str) -> Any:

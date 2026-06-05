@@ -528,6 +528,169 @@ class FeishuAdapter(Adapter):
 
     # ----------------------------------------------------------------- outbound
 
+    async def _upload_image(self, file_path: str) -> str:
+        """Upload a local image file to Feishu and return the image_key.
+
+        Uses im.v1.image.create with image_type='message'.
+        """
+        if self._lark_client is None:
+            raise SendError("feishu adapter not started; cannot upload image")
+
+        from pathlib import Path
+        from lark_oapi.api.im.v1 import (
+            CreateImageRequest,
+            CreateImageRequestBody,
+        )
+
+        path = Path(file_path)
+        if not path.is_file():
+            raise SendError(f"feishu adapter: file not found: {file_path}")
+
+        f = open(path, "rb")
+        request = (
+            CreateImageRequest.builder()
+            .request_body(
+                CreateImageRequestBody.builder()
+                .image_type("message")
+                .image(f)
+                .build()
+            )
+            .build()
+        )
+
+        try:
+            response = await asyncio.to_thread(
+                self._lark_client.im.v1.image.create, request
+            )
+        except Exception as e:
+            raise SendError(f"feishu im.v1.image.create raised: {e}") from e
+        finally:
+            f.close()
+
+        if not response.success():
+            raise SendError(
+                f"feishu image upload failed: code={response.code}, msg={response.msg}"
+            )
+
+        image_key = response.data.image_key if response.data else ""
+        if not image_key:
+            raise SendError("feishu image upload returned no image_key")
+        log.debug("feishu: uploaded image %s -> image_key=%s", path.name, image_key)
+        return image_key
+
+    async def _upload_file(self, file_path: str, file_name: str | None = None) -> str:
+        """Upload a local file to Feishu and return the file_key.
+
+        Uses im.v1.file.create with auto-detected file_type.
+        """
+        if self._lark_client is None:
+            raise SendError("feishu adapter not started; cannot upload file")
+
+        from pathlib import Path
+        from lark_oapi.api.im.v1 import (
+            CreateFileRequest,
+            CreateFileRequestBody,
+        )
+
+        path = Path(file_path)
+        if not path.is_file():
+            raise SendError(f"feishu adapter: file not found: {file_path}")
+
+        name = file_name or path.name
+        # Feishu file_type: opus, mp4, pdf, doc, xls, ppt, stream
+        ext = path.suffix.lower().lstrip(".")
+        type_map = {
+            "pdf": "pdf", "doc": "doc", "docx": "doc",
+            "xls": "xls", "xlsx": "xls",
+            "ppt": "ppt", "pptx": "ppt",
+            "mp4": "mp4", "opus": "opus", "ogg": "opus",
+        }
+        file_type = type_map.get(ext, "stream")
+
+        f = open(path, "rb")
+        request = (
+            CreateFileRequest.builder()
+            .request_body(
+                CreateFileRequestBody.builder()
+                .file_type(file_type)
+                .file_name(name)
+                .file(f)
+                .build()
+            )
+            .build()
+        )
+
+        try:
+            response = await asyncio.to_thread(
+                self._lark_client.im.v1.file.create, request
+            )
+        except Exception as e:
+            raise SendError(f"feishu im.v1.file.create raised: {e}") from e
+        finally:
+            f.close()
+
+        if not response.success():
+            raise SendError(
+                f"feishu file upload failed: code={response.code}, msg={response.msg}"
+            )
+
+        file_key = response.data.file_key if response.data else ""
+        if not file_key:
+            raise SendError("feishu file upload returned no file_key")
+        log.debug("feishu: uploaded file %s -> file_key=%s", name, file_key)
+        return file_key
+
+    async def _resolve_image_key(self, att: "Attachment") -> str:
+        """Resolve an image attachment to a Feishu image_key."""
+        import os
+        import tempfile
+
+        if att.path:
+            return await self._upload_image(att.path)
+        elif att.url:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(att.url, timeout=30)
+                resp.raise_for_status()
+                img_data = resp.content
+            suffix = att.ext or ".png"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(img_data)
+                tmp_path = tmp.name
+            try:
+                return await self._upload_image(tmp_path)
+            finally:
+                os.unlink(tmp_path)
+        return ""
+
+    async def _resolve_file_key(self, att: "Attachment") -> tuple[str, str]:
+        """Resolve a non-image file attachment to (file_key, filename)."""
+        import os
+        import tempfile
+
+        filename = att.name or "file"
+        if att.path:
+            from pathlib import Path
+            filename = att.name or Path(att.path).name
+            file_key = await self._upload_file(att.path, file_name=filename)
+            return file_key, filename
+        elif att.url:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(att.url, timeout=60)
+                resp.raise_for_status()
+                file_data = resp.content
+            suffix = att.ext or ""
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(file_data)
+                tmp_path = tmp.name
+            try:
+                file_key = await self._upload_file(tmp_path, file_name=filename)
+                return file_key, filename
+            finally:
+                os.unlink(tmp_path)
+        return "", filename
+
     async def send(
         self,
         conv_id: str,
@@ -548,19 +711,78 @@ class FeishuAdapter(Adapter):
         elif conv_id.startswith("ou_"):
             receive_id_type = "open_id"
         else:
-            # Fallback: try as chat_id
             receive_id_type = "chat_id"
 
         text = content.text or ""
-        # Use interactive card with markdown element for rich rendering
-        msg_content = json_mod.dumps({
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": text,
-                }
-            ],
-        }, ensure_ascii=False)
+        images = [att for att in content.attachments if att.is_image]
+        files = [att for att in content.attachments if not att.is_image]
+
+        # Resolve image attachments to image_keys
+        image_keys: list[str] = []
+        for att in images:
+            try:
+                key = await self._resolve_image_key(att)
+                if key:
+                    image_keys.append(key)
+                else:
+                    log.warning("feishu: image attachment has no path or url, skipping")
+            except Exception as e:
+                log.error("feishu: failed to resolve image: %s", e)
+
+        # Build interactive card elements: markdown + images in one message
+        elements: list[dict[str, Any]] = []
+        if text:
+            elements.append({"tag": "markdown", "content": text})
+        for key in image_keys:
+            elements.append({
+                "tag": "img",
+                "img_key": key,
+                "alt": {"tag": "plain_text", "content": ""},
+            })
+
+        last_msg_id = ""
+        last_data: dict[str, Any] = {}
+
+        # Send text + images as one interactive card
+        if elements:
+            msg_content = json_mod.dumps({"elements": elements}, ensure_ascii=False)
+            last_msg_id, last_data = await self._send_message(
+                conv_id, receive_id_type, "interactive", msg_content
+            )
+
+        # Send each file attachment as a separate file message
+        for att in files:
+            try:
+                file_key, filename = await self._resolve_file_key(att)
+                if file_key:
+                    file_content = json_mod.dumps({"file_key": file_key}, ensure_ascii=False)
+                    last_msg_id, last_data = await self._send_message(
+                        conv_id, receive_id_type, "file", file_content
+                    )
+            except Exception as e:
+                log.error("feishu: failed to send file attachment: %s", e)
+
+        # Fallback: empty content
+        if not elements and not files:
+            msg_content = json_mod.dumps({"elements": [{"tag": "markdown", "content": ""}]}, ensure_ascii=False)
+            last_msg_id, last_data = await self._send_message(
+                conv_id, receive_id_type, "interactive", msg_content
+            )
+
+        return last_msg_id, last_data
+
+    async def _send_message(
+        self,
+        conv_id: str,
+        receive_id_type: str,
+        msg_type: str,
+        msg_content: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Low-level helper: send one message via im.v1.message.create."""
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
 
         request = (
             CreateMessageRequest.builder()
@@ -569,7 +791,7 @@ class FeishuAdapter(Adapter):
                 CreateMessageRequestBody.builder()
                 .receive_id(conv_id)
                 .content(msg_content)
-                .msg_type("interactive")
+                .msg_type(msg_type)
                 .uuid(str(uuid.uuid4()))
                 .build()
             )

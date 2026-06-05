@@ -397,9 +397,40 @@ class WecomAdapter(Adapter):
             raise SendError("wecom adapter not started; call start() first")
 
         text = content.text or ""
-        body = {
+        images = [att for att in content.attachments if att.is_image]
+        files = [att for att in content.attachments if not att.is_image]
+
+        # Build markdown body: text + inline images via ![](url) syntax
+        parts: list[str] = []
+        if text:
+            parts.append(text)
+
+        for att in images:
+            if att.url:
+                parts.append(f"![image]({att.url})")
+            elif att.path:
+                log.warning(
+                    "wecom: local image sending not supported (no upload API), skipping: %s",
+                    att.path,
+                )
+
+        for att in files:
+            if att.url:
+                fname = att.name or "file"
+                parts.append(f"[{fname}]({att.url})")
+            elif att.path:
+                log.warning(
+                    "wecom: local file sending not supported (no upload API), skipping: %s",
+                    att.path,
+                )
+
+        markdown_content = "\n".join(parts) if parts else ""
+        if not markdown_content:
+            markdown_content = " "  # WeCom rejects empty content (errcode 44004)
+
+        body: dict[str, Any] = {
             "msgtype": "markdown",
-            "markdown": {"content": text},
+            "markdown": {"content": markdown_content},
         }
 
         try:
