@@ -61,16 +61,16 @@ async def _seed_inbound(
 # ------------------------------------------------------------------ lifecycle / lock
 
 
-async def test_enter_exit_acquires_and_releases_agent_lock(tmp_path: Path):
+async def test_enter_exit_acquires_and_releases_client_lock(tmp_path: Path):
     async with Client(tmp_path) as client:
         assert client.store is not None
-        assert (tmp_path / "agent.lock").exists()
+        assert (tmp_path / "client.lock").exists()
     # After exit, a fresh Client must be able to re-acquire.
     async with Client(tmp_path):
         pass
 
 
-async def test_second_client_blocked_by_agent_lock(tmp_path: Path):
+async def test_second_client_blocked_by_client_lock(tmp_path: Path):
     async with Client(tmp_path):
         with pytest.raises(AlreadyRunning):
             async with Client(tmp_path):

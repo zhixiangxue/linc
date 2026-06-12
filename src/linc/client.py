@@ -1,23 +1,34 @@
 """Agent-side SDK: ``Client`` context manager + ``Messenger`` handle.
 
-Typical usage in an agent script (NOT inside the gateway process)::
+Typical usage with a manually started gateway::
 
     async with Client(".linc") as client:
         unread = await client.slack.read_unread()
         for m in unread:
             await client.slack.send(conv_id=m.conv_id, content=f"echo: {m.content.text}")
 
+Typical usage with programmatic startup::
+
+    client = await launch("linc.yaml")
+    try:
+        unread = await client.read_unread()
+    finally:
+        await client.close()
+
 Design notes:
-- ``Client.__aenter__`` acquires ``agent.lock`` flock so at most one agent process
-  talks to a given data_dir at a time. The gateway holds its own ``linc.pid``
-  lock; the two are independent — gateway and agent can (and must) coexist.
+- ``Client.__aenter__`` acquires ``client.lock`` flock so at most one Client
+  process talks to a given data_dir at a time. The gateway holds its own
+  ``linc.pid`` lock; the two are independent — gateway and Client can (and
+  must) coexist.
 - ``client.messenger(platform)`` is the preferred explicit way to obtain a platform
   messenger. ``client.<platform>`` is resolved via ``__getattr__`` with adapter
   registry validation.
 - The client does NOT instantiate adapters and does NOT need ``linc.yaml``. It
   only needs read/write access to the SQLite file at ``<data_dir>/linc.db``.
+- When created by ``launch()``, the same Client may also own a gateway subprocess
+  for lifecycle cleanup; its message API remains identical.
 - All write operations go through the SAME ``SqliteStore`` API used by the
-  gateway, so concurrent gateway + agent are safe (single-writer SQLite via
+  gateway, so concurrent gateway + client are safe (single-writer SQLite via
   asyncio.Lock + WAL).
 
 Naming: ``Messenger`` is the per-platform SDK façade (a thin, stateless proxy over
@@ -27,12 +38,16 @@ gateway-side ``Adapter``'s job.
 
 from __future__ import annotations
 
+import atexit
+import os
+import signal
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from .adapters import is_supported, supported
-from .core.locks import acquire_agent_lock, release
+from .core.locks import acquire_client_lock, release
 from .core.models import Content, InboundMessage, OutboundDraft, OutboundMessage
 from .core.store import SqliteStore
 
@@ -40,17 +55,27 @@ from .core.store import SqliteStore
 class Client:
     """Async context manager — the agent-side entry point."""
 
-    def __init__(self, data_dir: str | Path = ".linc") -> None:
-        self._data_dir = Path(data_dir).expanduser()
+    def __init__(
+        self,
+        data_dir: str | Path = ".linc",
+        *,
+        gateway_process: subprocess.Popen[str] | None = None,
+        gateway_shutdown_timeout: float = 5.0,
+    ) -> None:
+        self._data_dir = Path(data_dir).expanduser().resolve()
         self._store: SqliteStore | None = None
         self._lock_fd: int | None = None
+        self._gateway_process = gateway_process
+        self._gateway_shutdown_timeout = gateway_shutdown_timeout
+        self._cleanup_handlers_registered = False
+        self._closed = False
 
     # ------------------------------------------------------------------ lifecycle
 
     async def __aenter__(self) -> "Client":
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        # flock first — fails fast if another agent already holds it.
-        self._lock_fd = acquire_agent_lock(self._data_dir)
+        # flock first — fails fast if another Client already holds it.
+        self._lock_fd = acquire_client_lock(self._data_dir)
         try:
             self._store = SqliteStore(self._data_dir / "linc.db")
             await self._store.open()
@@ -63,6 +88,27 @@ class Client:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the Client and any gateway subprocess it owns.
+
+        Manual ``Client(...)`` instances only close SQLite and release
+        ``client.lock``. Clients returned by ``launch()`` also terminate their
+        managed gateway subprocess.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._unregister_cleanup_handlers()
+        await self._close_store_and_lock()
+        self._terminate_gateway_process()
+
+    async def shutdown(self) -> None:
+        """Alias for close(), kept for launch-style lifecycle readability."""
+        await self.close()
+
+    async def _close_store_and_lock(self) -> None:
         if self._store is not None:
             try:
                 await self._store.close()
@@ -73,6 +119,70 @@ class Client:
                 release(self._lock_fd)
             finally:
                 self._lock_fd = None
+
+    def _register_cleanup_handlers(self) -> None:
+        """Register process-exit cleanup for a launch-managed Client."""
+        if self._gateway_process is None or self._cleanup_handlers_registered:
+            return
+        self._cleanup_handlers_registered = True
+        atexit.register(self._atexit_cleanup)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _unregister_cleanup_handlers(self) -> None:
+        if not self._cleanup_handlers_registered:
+            return
+        self._cleanup_handlers_registered = False
+        try:
+            atexit.unregister(self._atexit_cleanup)
+        except Exception:
+            pass
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    def _atexit_cleanup(self) -> None:
+        """Synchronous cleanup for interpreter exit."""
+        if self._closed:
+            return
+        self._closed = True
+        self._force_kill_gateway_process()
+
+    def _signal_handler(self, signum: int, frame: object) -> None:
+        """On Ctrl+C, kill the gateway group first, then re-raise signal."""
+        if not self._closed:
+            self._closed = True
+            self._force_kill_gateway_process()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    def _terminate_gateway_process(self) -> None:
+        """Gracefully terminate the managed gateway process group."""
+        proc = self._gateway_process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            proc.terminate()
+        try:
+            proc.wait(timeout=self._gateway_shutdown_timeout)
+        except subprocess.TimeoutExpired:
+            self._force_kill_gateway_process()
+
+    def _force_kill_gateway_process(self) -> None:
+        """Immediately kill the managed gateway process group."""
+        proc = self._gateway_process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            proc.kill()
+        proc.wait()
 
     # ------------------------------------------------------------------ store access
 

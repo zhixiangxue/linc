@@ -7,8 +7,8 @@ share an event loop across commands; each invocation is a fresh process.
 
 Read-only commands (unread, history, status, tail) only need ``--data-dir`` and
 talk to SQLite directly. ``serve`` needs ``--config`` (the YAML) since adapter
-instantiation lives there. ``send`` goes through the agent SDK so it acquires
-``agent.lock`` like any other agent process.
+instantiation lives there. ``send`` goes through the Client SDK so it acquires
+``client.lock`` like any other Client process.
 """
 
 from __future__ import annotations
@@ -124,14 +124,18 @@ def serve(
     config: Path = typer.Option(DEFAULT_CONFIG, "--config", "-c", help="linc.yaml path"),
 ) -> None:
     """Start the gateway daemon (single-instance per data_dir)."""
-    from rich.logging import RichHandler
+    launch_mode = os.getenv("LINC_LAUNCH_PROGRESS") == "1"
+    if launch_mode:
+        logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    else:
+        from rich.logging import RichHandler
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="[%H:%M:%S]",
-        handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
-    )
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            datefmt="[%H:%M:%S]",
+            handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
+        )
     logging.getLogger("aiorun").setLevel(logging.WARNING)
     if not config.exists():
         _die(f"config not found: {config}")
@@ -150,23 +154,25 @@ def serve(
             return
         shutdown_started = True
         await gateway.stop()
-        typer.echo("linc serve: stopped")
+        if not launch_mode:
+            typer.echo("linc serve: stopped")
 
     async def _run() -> None:
-        # --- Banner (before start, so runtime logs appear below) ---
-        import pyfiglet
-        from rich.console import Console
+        if not launch_mode:
+            # --- Banner (before start, so runtime logs appear below) ---
+            import pyfiglet
+            from rich.console import Console
 
-        console = Console()
-        art = pyfiglet.figlet_format("LINC", font="slant")
-        platforms = ", ".join(sorted(gateway.config.adapters)) or "(none)"
+            console = Console()
+            art = pyfiglet.figlet_format("LINC", font="slant")
+            platforms = ", ".join(sorted(gateway.config.adapters)) or "(none)"
 
-        console.print(f"\n{art}", style="cyan bold", highlight=False)
-        console.print(f"  PID:       {os.getpid()}", highlight=False)
-        console.print(f"  data:      {gateway.config.data_dir.resolve()}", highlight=False)
-        console.print(f"  platforms: [bold green]{platforms}[/bold green]", highlight=False)
-        console.print(f"  poll:      {gateway.config.poll_interval_ms}ms", highlight=False)
-        console.print("\n  Press Ctrl+C to stop.\n", highlight=False)
+            console.print(f"\n{art}", style="cyan bold", highlight=False)
+            console.print(f"  PID:       {os.getpid()}", highlight=False)
+            console.print(f"  data:      {gateway.config.data_dir.resolve()}", highlight=False)
+            console.print(f"  platforms: [bold green]{platforms}[/bold green]", highlight=False)
+            console.print(f"  poll:      {gateway.config.poll_interval_ms}ms", highlight=False)
+            console.print("\n  Press Ctrl+C to stop.\n", highlight=False)
 
         try:
             await gateway.start()
@@ -245,7 +251,7 @@ def send(
     text: str = typer.Argument(..., help="message text"),
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", "-d"),
 ) -> None:
-    """Enqueue a single outbound message (acquires agent.lock; gateway will deliver)."""
+    """Enqueue a single outbound message (acquires client.lock; gateway will deliver)."""
 
     async def _run() -> None:
         try:

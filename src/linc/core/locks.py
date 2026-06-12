@@ -1,8 +1,8 @@
 """Single-instance lock utilities (cross-platform: Linux/macOS/Windows).
 
 Two locks live under data_dir:
-  - linc.pid    : held by `linc serve` for as long as the daemon (LincGateway) runs.
-  - agent.lock  : held by the agent process inside `async with Linc(...)`.
+  - linc.pid     : held by `linc serve` for as long as the daemon (LincGateway) runs.
+  - client.lock  : held by the Client process while it reads/writes linc.db.
 
 On POSIX systems we use fcntl.flock(LOCK_EX | LOCK_NB).
 On Windows we use msvcrt.locking(LK_NBLCK).
@@ -98,6 +98,11 @@ def acquire_gateway_lock(data_dir: Path) -> int:
     return _acquire(Path(data_dir) / "linc.pid", "linc-gateway")
 
 
+def acquire_client_lock(data_dir: Path) -> int:
+    """Acquire the Client single-instance lock at <data_dir>/client.lock."""
+    return _acquire(Path(data_dir) / "client.lock", "linc-client")
+
+
 def acquire_agent_lock(data_dir: Path) -> int:
-    """Acquire the agent single-instance lock at <data_dir>/agent.lock."""
-    return _acquire(Path(data_dir) / "agent.lock", "linc-agent")
+    """Backward-compatible alias for acquire_client_lock."""
+    return acquire_client_lock(data_dir)

@@ -229,3 +229,4 @@ spike/
 design/
 *.yaml
 playground/
+.DS_Store

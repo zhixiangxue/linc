@@ -9,6 +9,7 @@ from .core.models import (
     OutboundMessage,
     Sender,
 )
+from .launch import launch
 
 __version__ = "0.1.0dev0"
 
@@ -21,5 +22,6 @@ __all__ = [
     "InboundMessage",
     "OutboundMessage",
     "OutboundDraft",
+    "launch",
     "__version__",
 ]

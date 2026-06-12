@@ -1,8 +1,12 @@
 """Example: a cross-platform LLM chat agent powered by Chak + Bailian Qwen-VL.
 
-Run this while ``linc serve -c linc.yaml`` is running. The agent reads unread
-messages from all configured platforms, sends each user message (text + images)
-to Qwen-VL via chak, and replies back to the same conversation.
+Single-command startup — ``launch()`` handles gateway + client in one line::
+
+    python examples/llm_agent.py
+
+The agent reads unread messages from all configured platforms, sends each
+user message (text + images) to Qwen-VL via chak, and replies back to the
+same conversation.
 
 Configuration:
   - Put ``BAILIAN_API_KEY=...`` in the project ``.env`` file, or export it in
@@ -19,7 +23,7 @@ from pathlib import Path
 
 import chak
 
-from linc import Client
+from linc import launch
 from linc.core.models import Attachment
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
@@ -147,7 +151,8 @@ async def main() -> None:
     # value = {"messages": [...], "last_ts": float}
     pending: dict[tuple[str, str], dict] = {}
 
-    async with Client(".linc") as client:
+    client = await launch("linc.yaml")
+    try:
         log.info("llm agent started with %s; debounce=%.1fs", MODEL_URI, DEBOUNCE_SECONDS)
         while True:
             unread = await client.read_unread()
@@ -213,6 +218,8 @@ async def main() -> None:
                 await messenger.send(reply, conv_id=conv_id)
 
             await asyncio.sleep(1.0)
+    finally:
+        await client.close()
 
 
 if __name__ == "__main__":

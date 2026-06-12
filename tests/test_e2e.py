@@ -2,7 +2,7 @@
 agent client in the same process, mediated only by SQLite + the two flocks.
 
 These tests exist to verify the **architectural promise**:
-  - linc.pid (gateway) and agent.lock (client) are independent — the two
+  - linc.pid (gateway) and client.lock (client) are independent — the two
     processes are designed to coexist on the same data_dir.
   - The full inbound path works: adapter.inject -> store -> client.read_unread.
   - The full outbound path works: client.send -> outbox -> dispatcher ->
@@ -65,14 +65,14 @@ async def _wait_until(predicate, timeout: float = 2.0, tick: float = 0.02) -> No
 
 
 async def test_gateway_and_client_locks_coexist(cfg, fake_registered):
-    """linc.pid and agent.lock are independent flocks on different files."""
+    """linc.pid and client.lock are independent flocks on different files."""
     gateway = LincGateway(cfg)
     await gateway.start()
     try:
         # Agent client must be able to enter while gateway runs.
         async with Client(cfg.data_dir):
             assert (cfg.data_dir / "linc.pid").exists()
-            assert (cfg.data_dir / "agent.lock").exists()
+            assert (cfg.data_dir / "client.lock").exists()
     finally:
         await gateway.stop()
 

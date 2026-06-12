@@ -12,7 +12,7 @@
 ```
 
 - One file (`.linc/linc.db`) is the contract. Crash the agent, restart it — no message loss.
-- The gateway and the agent are independent processes guarded by two `flock` files (`linc.pid` + `agent.lock`).
+- The gateway and the Client are independent processes guarded by two `flock` files (`linc.pid` + `client.lock`).
 - All adapters share one `Hub` (HTTP client pool, future shared web server) so adding a new IM platform never duplicates infra.
 
 ---
@@ -44,21 +44,15 @@ chmod 600 linc.yaml          # gateway warns otherwise
 $EDITOR linc.yaml
 ```
 
-### 3. Run the gateway
-
-```bash
-linc serve -c linc.yaml
-```
-
-This starts the daemon, opens `.linc/linc.db`, acquires `.linc/linc.pid` flock, and keeps a Slack Socket Mode WebSocket open. Leave it running.
-
-### 4. Run an agent (in another terminal)
+### 3. Run an agent
 
 ```bash
 python examples/echo_agent.py
 ```
 
-Send a DM to your bot in Slack — the agent echoes it back. That's it.
+`launch("linc.yaml")` starts the gateway for you and returns a `Client`. Send a DM to your bot in Slack — the agent echoes it back. That's it.
+
+If you prefer manual process management, you can still run `linc serve -c linc.yaml` separately and connect with `Client(".linc")`.
 
 ---
 
@@ -66,18 +60,22 @@ Send a DM to your bot in Slack — the agent echoes it back. That's it.
 
 ```python
 import asyncio
-from linc import Linc
+from linc import launch
 
 async def main():
-    async with Linc(".linc") as linc:
-        slack = linc.slack()
-        for m in await slack.read_unread():
-            await slack.send(f"echo: {m.content.text}", conv_id=m.conv_id)
+    client = await launch("linc.yaml")
+    try:
+        for m in await client.read_unread():
+            await client.messenger(m.platform).send(
+                f"echo: {m.content.text}", conv_id=m.conv_id
+            )
+    finally:
+        await client.close()
 
 asyncio.run(main())
 ```
 
-`linc.<platform>()` returns a stateless `Client` handle (think `boto3.client('s3')`). Unknown platform names fail loudly with `AttributeError` instead of silently no-op'ing.
+`launch()` returns a real `Client`. If the gateway is already managed elsewhere, use `async with Client(".linc") as client:` and keep the same message API.
 
 ---
 
@@ -88,7 +86,7 @@ asyncio.run(main())
 | `linc serve [-c linc.yaml]` | Start the gateway daemon. SIGINT/SIGTERM stops cleanly. |
 | `linc unread [-p slack] [--json]` | Peek unread messages without consuming them. |
 | `linc history -p slack [-C C123] [-n 50]` | Show inbound + outbound history for a conversation. |
-| `linc send slack C123 "hi"` | Enqueue an outbound message via the agent SDK. |
+| `linc send slack C123 "hi"` | Enqueue an outbound message via the Client SDK. |
 | `linc tail [-p slack]` | Stream new messages as they land. |
 | `linc status` | Probe whether a gateway is running for the given `data_dir`. |
 
@@ -99,8 +97,8 @@ All commands accept `--data-dir`, defaulting to `.linc`.
 ## Examples
 
 - [`examples/echo_agent.py`](examples/echo_agent.py) — minimal `unread → echo` loop.
-- [`examples/llm_agent.py`](examples/llm_agent.py) — same shape, with a stub `call_llm()` to plug in your own client (OpenAI / Anthropic / local Ollama).
-- [`examples/multi_platform.py`](examples/multi_platform.py) — one agent serving every registered platform via `linc.read_unread_all()`.
+- [`examples/llm_agent.py`](examples/llm_agent.py) — cross-platform LLM chat agent with multimodal attachment handling.
+- Use `client.read_unread()` to serve every registered platform from one loop.
 
 ---
 
@@ -109,7 +107,7 @@ All commands accept `--data-dir`, defaulting to `.linc`.
 ```
 src/linc/
 ├── gateway.py          # LincGateway daemon: lifecycle + outbox dispatcher
-├── client.py           # Linc / Client — agent-side SDK
+├── client.py           # Client / Messenger — agent-side SDK
 ├── cli.py              # `linc` typer entry point
 ├── adapters/
 │   ├── __init__.py     # adapter registry (REGISTRY + register/get/...)
@@ -120,7 +118,7 @@ src/linc/
     ├── errors.py       # AlreadyRunning / SendError / ConfigError / UnknownPlatform
     ├── http.py         # HttpClient ABC + HttpxClient (5xx exponential backoff)
     ├── hub.py          # Shared infra (HttpClient pool, future web server)
-    ├── locks.py        # fcntl flock helpers (linc.pid + agent.lock)
+    ├── locks.py        # fcntl flock helpers (linc.pid + client.lock)
     ├── models.py       # Pydantic v2: Content / InboundMessage / OutboundMessage / ...
     ├── schema.py       # SQLite DDL
     └── store.py        # SqliteStore (single-conn + WAL + asyncio.Lock)
