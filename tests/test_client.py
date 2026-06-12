@@ -126,7 +126,7 @@ async def test_get_unknown_platform_raises_value_error(tmp_path: Path, fake_regi
 
 async def test_send_string_enqueues_pending_outbound(tmp_path: Path, fake_registered):
     async with Client(tmp_path) as client:
-        row_id = await client.messenger("fake").send("hello world", conv_id="C1")
+        row_id = await client.send("hello world", platform="fake", conv_id="C1")
         assert row_id > 0
         rows = await client.store.list_pending("fake")
         assert len(rows) == 1
@@ -135,7 +135,19 @@ async def test_send_string_enqueues_pending_outbound(tmp_path: Path, fake_regist
         assert rows[0].content.text == "hello world"
 
 
-async def test_send_content_with_attachments(tmp_path: Path, fake_registered):
+async def test_send_requires_keyword_platform_and_conv_id(tmp_path: Path, fake_registered):
+    async with Client(tmp_path) as client:
+        with pytest.raises(TypeError):
+            await client.send("hello world", "fake", "C1")
+
+
+async def test_send_unknown_platform_raises(tmp_path: Path, fake_registered):
+    async with Client(tmp_path) as client:
+        with pytest.raises(ValueError, match="unknown IM platform"):
+            await client.send("hello world", platform="wxchat", conv_id="C1")
+
+
+async def test_messenger_send_content_with_attachments(tmp_path: Path, fake_registered):
     payload = Content(
         text="see image",
         attachments=[Attachment(kind="image", url="https://x/y.png")],
@@ -182,45 +194,73 @@ async def test_conv_chain_returns_new_handle(tmp_path: Path, fake_registered):
         assert rows[0].conv_id == "C-chain"
 
 
-# ------------------------------------------------------------------ read_unread
+# ------------------------------------------------------------------ pull
 
 
-async def test_read_unread_claims_messages(tmp_path: Path, fake_registered):
+async def test_pull_claims_messages(tmp_path: Path, fake_registered):
     await _seed_inbound(tmp_path, conv_id="C1", msg_id="m1", text="hi", ts=1.0)
     await _seed_inbound(tmp_path, conv_id="C1", msg_id="m2", text="ho", ts=2.0)
     async with Client(tmp_path) as client:
-        msgs = await client.fake.read_unread()
+        msgs = await client.fake.pull()
         assert [m.content.text for m in msgs] == ["hi", "ho"]
         # Second call returns nothing — they were claimed.
-        again = await client.fake.read_unread()
+        again = await client.fake.pull()
         assert again == []
 
 
-async def test_read_unread_respects_bound_conv_id(tmp_path: Path, fake_registered):
+async def test_pull_respects_bound_conv_id(tmp_path: Path, fake_registered):
     await _seed_inbound(tmp_path, conv_id="C1", msg_id="m1", text="a", ts=1.0)
     await _seed_inbound(tmp_path, conv_id="C2", msg_id="m2", text="b", ts=2.0)
     async with Client(tmp_path) as client:
-        msgs = await client.messenger("fake", conv_id="C2").read_unread()
+        msgs = await client.messenger("fake", conv_id="C2").pull()
         assert [m.content.text for m in msgs] == ["b"]
         # C1 still claimable.
-        leftover = await client.fake.read_unread()
+        leftover = await client.fake.pull()
         assert [m.content.text for m in leftover] == ["a"]
 
 
-async def test_list_unread_does_not_claim(tmp_path: Path, fake_registered):
+async def test_peek_does_not_claim(tmp_path: Path, fake_registered):
     await _seed_inbound(tmp_path, msg_id="m1", text="peek", ts=1.0)
     async with Client(tmp_path) as client:
-        peek = await client.fake.list_unread()
+        peek = await client.fake.peek()
         assert len(peek) == 1
         # Still claimable afterwards.
-        msgs = await client.fake.read_unread()
+        msgs = await client.fake.pull()
         assert len(msgs) == 1
+
+
+async def test_client_peek_filters_by_platform_and_conv(tmp_path: Path, fake_registered):
+    class FakeTwo(FakeAdapter):
+        name = "fake2"
+
+    register(FakeTwo)
+    try:
+        await _seed_inbound(tmp_path, platform="fake", conv_id="C1", msg_id="m1", text="a", ts=1.0)
+        await _seed_inbound(tmp_path, platform="fake", conv_id="C2", msg_id="m2", text="b", ts=2.0)
+        await _seed_inbound(tmp_path, platform="fake2", conv_id="C1", msg_id="m3", text="c", ts=3.0)
+        async with Client(tmp_path) as client:
+            peeked = await client.peek(platform="fake", conv_id="C2")
+            assert [(m.platform, m.conv_id, m.content.text) for m in peeked] == [
+                ("fake", "C2", "b")
+            ]
+            pulled = await client.pull(platform="fake", conv_id="C2")
+            assert [(m.platform, m.conv_id, m.content.text) for m in pulled] == [
+                ("fake", "C2", "b")
+            ]
+    finally:
+        unregister("fake2")
+
+
+async def test_peek_unknown_platform_raises(tmp_path: Path, fake_registered):
+    async with Client(tmp_path) as client:
+        with pytest.raises(ValueError, match="unknown IM platform"):
+            await client.peek(platform="wxchat")
 
 
 # ------------------------------------------------------------------ cross-platform helpers
 
 
-async def test_read_unread_spans_platforms(tmp_path: Path, fake_registered):
+async def test_pull_spans_platforms(tmp_path: Path, fake_registered):
     # Register a second fake platform under a different name to verify the
     # cross-platform claim is truly cross-platform.
     class FakeTwo(FakeAdapter):
@@ -231,10 +271,39 @@ async def test_read_unread_spans_platforms(tmp_path: Path, fake_registered):
         await _seed_inbound(tmp_path, platform="fake", msg_id="m1", text="a", ts=1.0)
         await _seed_inbound(tmp_path, platform="fake2", msg_id="m2", text="b", ts=2.0)
         async with Client(tmp_path) as client:
-            msgs = await client.read_unread()
+            msgs = await client.pull()
             assert [m.platform for m in msgs] == ["fake", "fake2"]
     finally:
         unregister("fake2")
+
+
+async def test_pull_filters_by_platform_and_conv(tmp_path: Path, fake_registered):
+    class FakeTwo(FakeAdapter):
+        name = "fake2"
+
+    register(FakeTwo)
+    try:
+        await _seed_inbound(tmp_path, platform="fake", conv_id="C1", msg_id="m1", text="a", ts=1.0)
+        await _seed_inbound(tmp_path, platform="fake", conv_id="C2", msg_id="m2", text="b", ts=2.0)
+        await _seed_inbound(tmp_path, platform="fake2", conv_id="C1", msg_id="m3", text="c", ts=3.0)
+        async with Client(tmp_path) as client:
+            msgs = await client.pull(platform="fake", conv_id="C2")
+            assert [(m.platform, m.conv_id, m.content.text) for m in msgs] == [
+                ("fake", "C2", "b")
+            ]
+            leftover = await client.pull()
+            assert [(m.platform, m.conv_id, m.content.text) for m in leftover] == [
+                ("fake", "C1", "a"),
+                ("fake2", "C1", "c"),
+            ]
+    finally:
+        unregister("fake2")
+
+
+async def test_pull_unknown_platform_raises(tmp_path: Path, fake_registered):
+    async with Client(tmp_path) as client:
+        with pytest.raises(ValueError, match="unknown IM platform"):
+            await client.pull(platform="wxchat")
 
 
 async def test_history_returns_inbound_and_outbound(tmp_path: Path, fake_registered):

@@ -4,7 +4,7 @@ agent client in the same process, mediated only by SQLite + the two flocks.
 These tests exist to verify the **architectural promise**:
   - linc.pid (gateway) and client.lock (client) are independent — the two
     processes are designed to coexist on the same data_dir.
-  - The full inbound path works: adapter.inject -> store -> client.read_unread.
+  - The full inbound path works: adapter.inject -> store -> client.pull.
   - The full outbound path works: client.send -> outbox -> dispatcher ->
     adapter.send -> store.mark_sent.
   - An echo loop completes within a couple of dispatcher ticks.
@@ -81,7 +81,7 @@ async def test_gateway_and_client_locks_coexist(cfg, fake_registered):
 
 
 async def test_inbound_adapter_to_client(cfg, fake_registered):
-    """adapter.inject seeds the store; client.read_unread claims it."""
+    """adapter.inject seeds the store; client.pull claims it."""
     gateway = LincGateway(cfg)
     await gateway.start()
     try:
@@ -96,10 +96,10 @@ async def test_inbound_adapter_to_client(cfg, fake_registered):
             }
         )
         async with Client(cfg.data_dir) as client:
-            msgs = await client.fake.read_unread()
+            msgs = await client.fake.pull()
             assert [m.content.text for m in msgs] == ["ping"]
             # Claimed exactly once.
-            again = await client.fake.read_unread()
+            again = await client.fake.pull()
             assert again == []
     finally:
         await gateway.stop()
@@ -142,7 +142,7 @@ async def test_echo_agent_loop(cfg, fake_registered):
     """The canonical demo: an agent that echoes every inbound back to the same conv.
 
     Verifies the entire two-way roundtrip in a single test:
-        adapter.inject -> store.in -> agent.read_unread -> agent.send
+        adapter.inject -> store.in -> agent.pull -> agent.send
                        -> store.out -> dispatcher -> adapter.send
     """
     gateway = LincGateway(cfg)
@@ -156,7 +156,7 @@ async def test_echo_agent_loop(cfg, fake_registered):
                 fake = client.fake
                 # Tight loop for the test — production agents would back off.
                 while not stop.is_set():
-                    msgs = await fake.read_unread()
+                    msgs = await fake.pull()
                     for m in msgs:
                         await fake.send(
                             f"echo: {m.content.text}", conv_id=m.conv_id
@@ -215,7 +215,7 @@ async def test_history_contains_both_directions_after_loop(cfg, fake_registered)
             }
         )
         async with Client(cfg.data_dir) as client:
-            msgs = await client.fake.read_unread()
+            msgs = await client.fake.pull()
             assert msgs[0].content.text == "ping"
             await client.fake.send("pong", conv_id="C1")
 

@@ -3,7 +3,7 @@
 Typical usage with a manually started gateway::
 
     async with Client(".linc") as client:
-        unread = await client.slack.read_unread()
+        unread = await client.slack.pull()
         for m in unread:
             await client.slack.send(conv_id=m.conv_id, content=f"echo: {m.content.text}")
 
@@ -11,7 +11,11 @@ Typical usage with programmatic startup::
 
     client = await launch("linc.yaml")
     try:
-        unread = await client.read_unread()
+        unread = await client.pull()
+        for m in unread:
+            await client.send(
+                f"echo: {m.content.text}", platform=m.platform, conv_id=m.conv_id
+            )
     finally:
         await client.close()
 
@@ -228,11 +232,66 @@ class Client:
 
     # ------------------------------------------------------------------ cross-platform helpers
 
-    async def read_unread(
-        self, limit: int | None = None,
+    async def pull(
+        self,
+        platform: str | None = None,
+        conv_id: str | None = None,
+        limit: int | None = None,
     ) -> list[InboundMessage]:
-        """Atomically claim unread messages across **all** platforms."""
-        return await self.store.claim_unread(platform=None, conv_id=None, limit=limit)
+        """Atomically pull new messages, optionally filtered by platform/conv.
+
+        With no filters, this pulls unread messages across all platforms and
+        claims them so they will not be returned again.
+        """
+        if platform is not None and not is_supported(platform):
+            raise ValueError(
+                f"unknown IM platform {platform!r}; "
+                f"registered platforms are {sorted(supported())}. "
+                f"Did you forget to import the adapter, or mistype the name?"
+            )
+        return await self.store.claim_unread(
+            platform=platform, conv_id=conv_id, limit=limit
+        )
+
+    async def peek(
+        self,
+        platform: str | None = None,
+        conv_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[InboundMessage]:
+        """Peek at new messages without claiming them."""
+        if platform is not None and not is_supported(platform):
+            raise ValueError(
+                f"unknown IM platform {platform!r}; "
+                f"registered platforms are {sorted(supported())}. "
+                f"Did you forget to import the adapter, or mistype the name?"
+            )
+        return await self.store.list_unread(
+            platform=platform, conv_id=conv_id, limit=limit
+        )
+
+    async def send(
+        self,
+        content: str | Content = "",
+        *,
+        platform: str,
+        conv_id: str,
+    ) -> int:
+        """Enqueue an outbound message for the gateway to deliver."""
+        if not is_supported(platform):
+            raise ValueError(
+                f"unknown IM platform {platform!r}; "
+                f"registered platforms are {sorted(supported())}. "
+                f"Did you forget to import the adapter, or mistype the name?"
+            )
+        if isinstance(content, str):
+            payload = Content(text=content)
+        else:
+            payload = content
+        draft = OutboundDraft(conv_id=conv_id, content=payload)
+        return await self.store.enqueue_outbound(
+            platform=platform, draft=draft, ts=time.time()
+        )
 
     async def history(
         self,
@@ -275,10 +334,10 @@ class Messenger:
 
     # ------------------------------------------------------------------ inbound
 
-    async def read_unread(
+    async def pull(
         self, conv_id: str | None = None, limit: int | None = None,
     ) -> list[InboundMessage]:
-        """Atomically claim unread inbound messages for this platform.
+        """Atomically pull new inbound messages for this platform.
 
         ``conv_id`` precedence: method arg > handle binding > None (all convs).
         """
@@ -287,10 +346,10 @@ class Messenger:
             platform=self.name, conv_id=cid, limit=limit
         )
 
-    async def list_unread(
+    async def peek(
         self, conv_id: str | None = None, limit: int | None = None,
     ) -> list[InboundMessage]:
-        """Peek at unread messages WITHOUT marking them read (debug/inspection)."""
+        """Peek at unread messages without claiming them."""
         cid = conv_id if conv_id is not None else self._conv_id
         return await self._store.list_unread(
             platform=self.name, conv_id=cid, limit=limit

@@ -65,9 +65,9 @@ from linc import launch
 async def main():
     client = await launch("linc.yaml")
     try:
-        for m in await client.read_unread():
-            await client.messenger(m.platform).send(
-                f"echo: {m.content.text}", conv_id=m.conv_id
+        for m in await client.pull():
+            await client.send(
+                f"echo: {m.content.text}", platform=m.platform, conv_id=m.conv_id
             )
     finally:
         await client.close()
@@ -98,7 +98,7 @@ All commands accept `--data-dir`, defaulting to `.linc`.
 
 - [`examples/echo_agent.py`](examples/echo_agent.py) — minimal `unread → echo` loop.
 - [`examples/llm_agent.py`](examples/llm_agent.py) — cross-platform LLM chat agent with multimodal attachment handling.
-- Use `client.read_unread()` to serve every registered platform from one loop.
+- Use `client.pull()` to serve every registered platform from one loop.
 
 ---
 

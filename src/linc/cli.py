@@ -256,8 +256,7 @@ def send(
     async def _run() -> None:
         try:
             async with Client(data_dir) as client:
-                messenger = client.messenger(platform)
-                row_id = await messenger.send(text, conv_id=conv_id)
+                row_id = await client.send(text, platform=platform, conv_id=conv_id)
         except AlreadyRunning as e:
             _die(str(e))
         except ValueError as e:

@@ -26,7 +26,7 @@ async def main() -> None:
     try:
         log.info("cross-platform echo agent started; waiting for unread messages...")
         while True:
-            unread = await client.read_unread()
+            unread = await client.pull()
             for m in unread:
                 reply = f"{m.content.text or ''}"
                 messenger = client.messenger(m.platform)

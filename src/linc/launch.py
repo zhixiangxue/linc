@@ -7,10 +7,10 @@ Usage::
     async def main():
         client = await launch("linc.yaml")
         try:
-            unread = await client.read_unread()
+            unread = await client.pull()
             for m in unread:
-                await client.messenger(m.platform).send(
-                    f"echo: {m.content.text}", conv_id=m.conv_id
+                await client.send(
+                    f"echo: {m.content.text}", platform=m.platform, conv_id=m.conv_id
                 )
         finally:
             await client.close()

@@ -155,7 +155,7 @@ async def main() -> None:
     try:
         log.info("llm agent started with %s; debounce=%.1fs", MODEL_URI, DEBOUNCE_SECONDS)
         while True:
-            unread = await client.read_unread()
+            unread = await client.pull()
             now = time.time()
 
             # 1) Incoming messages -> buffer
